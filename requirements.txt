@@ -1,2 +1,10 @@
-flask
-flask-cors
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+flask==3.1.0
+flask-cors==5.0.1
+numpy==1.26.4
+opencv-python==4.11.0.86
+pillow==10.4.0
+transformers==4.50.1
