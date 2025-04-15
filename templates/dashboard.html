@@ -5,7 +5,7 @@
   <title>AAU Robot Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    /* Grid: 3 rows (25%,25%,50%) x 2 columns */
+    /* Overall Grid: 3 rows, 2 columns */
     #dashboard {
       display: grid;
       grid-template-rows: 25% 25% 50%;
@@ -23,8 +23,8 @@
       position: relative;
       display: flex;
       flex-direction: column;
-      box-sizing: border-box;
       padding: 8px;
+      box-sizing: border-box;
     }
     .panel-title {
       position: absolute;
@@ -32,19 +32,49 @@
       left: 8px;
       font-weight: bold;
       color: #fff;
-      z-index: 1;
+      z-index: 2;
     }
-    img {
+    /* For video/image in each window */
+    .media-container {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
     }
-    #sideVideo {
-      width: auto;
-      height: 100%;
+    /* Keep video/image scaled to container height */
+    .media-content {
+      max-height: 100%;
+      max-width: 100%;
       object-fit: contain;
       display: block;
-      margin: 0 auto;
+    }
+    /* Overlay for image mode if no image is chosen */
+    #uploadButton {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: none;
+      background: rgba(0,0,0,0.5);
+      color: #4af;
+      font-size: 24px;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 4;
+    }
+    #fileUploadInput {
+      display: none;
+    }
+    .console-area {
+      background: #111;
+      border: 1px solid #4af;
+      font-family: monospace;
+      padding: 4px;
+      overflow-y: auto;
+      flex: 1;
     }
     .neon-btn {
       background-color: #222;
@@ -57,14 +87,6 @@
       color: #111;
       box-shadow: 0 0 8px #4af;
     }
-    .console-area {
-      background: #111;
-      border: 1px solid #4af;
-      font-family: monospace;
-      padding: 4px;
-      overflow-y: auto;
-      flex: 1;
-    }
     select {
       background-color: #2a2a2a;
       color: #4af;
@@ -74,78 +96,100 @@
   </style>
 </head>
 <body class="bg-gray-900 text-green-300">
+
 <div id="dashboard">
-  <!-- Row1, Col1: Side Camera -->
+  <!-- Row1, Col1: Side Camera (Window1) -->
   <div class="panel" style="grid-row:1; grid-column:1;">
     <div class="panel-title">Side Camera (Window1)</div>
-    <video id="sideVideo" autoplay muted playsinline></video>
+    <!-- Only 2 options: "camera" or "image" -->
+    <select id="sideCamModeSelect" style="position:absolute; top:8px; right:8px; z-index:5;">
+      <option value="camera">SideCam</option>
+      <option value="image">Image</option>
+    </select>
+    <div id="sideCamContainer" class="media-container">
+      <!-- If "camera", we show a live video feed -->
+      <video id="sideVideo" class="media-content" autoplay muted playsinline></video>
+      <!-- If "image", we show an uploaded image -->
+      <img id="sideImage" class="media-content" src="" alt="UploadedImage" style="display:none;">
+      <!-- Overlay for uploading an image if none is chosen yet -->
+      <div id="uploadButton">Click to upload or drag &amp; drop</div>
+      <input type="file" id="fileUploadInput" accept="image/*">
+    </div>
   </div>
-  <!-- Row1, Col2: Model Selection -->
-  <div class="panel" style="grid-row:1; grid-column:2; justify-content: center; align-items: center;">
+
+  <!-- Row1, Col2: Model Selection (Window5) -->
+  <div class="panel" style="grid-row:1; grid-column:2; justify-content:center; align-items:center;">
     <div class="panel-title">Model Selection (Window5)</div>
-    <div style="margin-top: 2rem; display: flex; flex-direction: column; gap: 1rem;">
+    <div style="margin-top:2rem; display:flex; flex-direction:column; gap:1rem;">
       <div>
-        <label for="vlmSelect" style="margin-right: 8px;">VLM:</label>
+        <label>VLM:</label>
         <select id="vlmSelect">
-          {% for opt in vlm_options %}
-          <option value="{{ opt }}">{{ opt }}</option>
-          {% endfor %}
+          <option>OpenVLM_1</option>
+          <option>OpenVLM_2</option>
+          <option>OpenVLM_3</option>
         </select>
       </div>
       <div>
-        <label for="llmSelect" style="margin-right: 8px;">LLM:</label>
+        <label>LLM:</label>
         <select id="llmSelect">
-          {% for opt in llm_options %}
-          <option value="{{ opt }}">{{ opt }}</option>
-          {% endfor %}
+          <option>ChatGPT</option>
+          <option>Llama</option>
+          <option>Claude</option>
         </select>
       </div>
     </div>
   </div>
-  <!-- Row2, Col1: Top Cameras (Seg & Depth Preview) -->
-  <div class="panel" style="grid-row:2; grid-column:1; flex-direction: row; padding: 0;">
-    <!-- Top Camera Segmentation -->
-    <div style="flex:1; position: relative; border-right: 1px solid #333; display: flex; align-items: center; justify-content: center;">
-      <div class="panel-title">Top Camera (Window2) - Seg</div>
-      <img id="topSegImg" src="https://via.placeholder.com/320x180?text=Seg+Camera" alt="TopSeg">
-      <select id="topSegMode" class="absolute" style="top:8px; right:8px;">
+
+  <!-- Row2, Col1: Window2 (Seg) + Window3 (Depth) side by side -->
+  <div class="panel" style="grid-row:2; grid-column:1; display:flex; flex-direction:row; padding:0;">
+    <!-- Window2: Seg -->
+    <div id="segContainer" class="media-container" style="flex:1; border-right:1px solid #333;">
+      <div class="panel-title">Seg (Window2)</div>
+      
+      <!-- "Live" camera feed mirrored here -->
+      <video id="segVideo" class="media-content" autoplay muted playsinline></video>
+      
+      <!-- Hidden <img> for showing the SAM result once we freeze -->
+      <img id="segImg" class="media-content" 
+          src="https://via.placeholder.com/320x180?text=Seg" 
+          alt="SegOutput" 
+          style="display:none;">
+      
+      <select id="segMode" style="position:absolute; top:8px; right:8px; z-index:5;">
         <option value="off">Off</option>
         <option value="seg">Seg</option>
       </select>
     </div>
-    <!-- Depth Preview -->
-    <div style="flex:1; position: relative; display: flex; align-items: center; justify-content: center;">
-      <div class="panel-title">Depth Camera (Window3)</div>
-      <img id="topDepthImg" src="https://via.placeholder.com/320x180?text=Depth+Camera" alt="DepthCam">
-      <select id="topDepthMode" class="absolute" style="top:8px; right:8px;">
-        <option value="off">Off</option>
-        <option value="default_anything">Default Camera + DepthAnything</option>
-        <option value="local_depth_anything">Local Camera + DepthAnything</option>
-        <option value="realsense_rgb_anything">RealSense RGB + DepthAnything</option>
-        <option value="realsense_depth">RealSense Depth</option>
-        <option value="other">Other Depth</option>
-      </select>
+
+    <!-- Window3: Depth -->
+    <div id="depthContainer" class="media-container" style="flex:1;">
+      <div class="panel-title">Depth (Window3)</div>
+      <img id="depthImg" class="media-content" src="https://via.placeholder.com/320x180?text=Depth" alt="DepthOutput">
+      <select id="depthMode" style="position:absolute; top:8px; right:8px; z-index:5;"></select>
     </div>
   </div>
-  <!-- Row2, Col2: Robot Control -->
-  <div class="panel" style="grid-row:2; grid-column:2; justify-content: center; align-items: center;">
+
+  <!-- Row2, Col2: Robot Control (Window6) -->
+  <div class="panel" style="grid-row:2; grid-column:2; justify-content:center; align-items:center;">
     <div class="panel-title">Robot Control (Window6)</div>
-    <div style="margin-top: 2rem; display: flex; flex-direction: row; gap: 1rem;">
+    <div style="margin-top:2rem; display:flex; gap:1rem;">
       <button class="neon-btn px-3 py-1" onclick="sendChat('move forward')">Forward</button>
       <button class="neon-btn px-3 py-1" onclick="sendChat('2 to the left')">Left x2</button>
       <button class="neon-btn px-3 py-1" onclick="sendChat('turn right')">Right</button>
     </div>
   </div>
-  <!-- Row3, Col1: Chat -->
+
+  <!-- Row3, Col1: Chat (Window4) -->
   <div class="panel" style="grid-row:3; grid-column:1;">
     <div class="panel-title">Chat (Window4)</div>
     <div id="chatMessages" style="flex:1; overflow-y:auto; background:#111; border:1px solid #666; padding:4px; margin-top:30px;"></div>
-    <div style="display:flex; margin-top:8px;">
+    <div style="margin-top:8px; display:flex;">
       <input type="text" id="chatInput" class="bg-gray-800 text-green-300 border border-green-500 px-2 py-1 flex-1" placeholder="Type command...">
-      <button id="sendChatBtn" class="neon-btn px-3 py-1" style="margin-left:8px;">Send</button>
+      <button id="chatSendBtn" class="neon-btn px-3 py-1" style="margin-left:8px;">Send</button>
     </div>
   </div>
-  <!-- Row3, Col2: LLM Reasoning Console -->
+
+  <!-- Row3, Col2: LLM Reasoning (Window7) -->
   <div class="panel" style="grid-row:3; grid-column:2; display:flex; flex-direction:column;">
     <div class="panel-title">LLM Reasoning (Window7)</div>
     <div id="llmConsole" class="console-area" style="margin-top:30px;"></div>
@@ -154,54 +198,265 @@
 
 <script>
 /****************************************************
- * 0) On page load: fetch camera info and adjust dropdown.
+ * Globals
  ****************************************************/
-window.addEventListener("DOMContentLoaded", async () => {
-  try {
-    const resp = await fetch("/camera_info");
-    if (!resp.ok) throw new Error("camera_info error: " + resp.status);
-    const data = await resp.json();
-    console.log("[camera_info]", data);
-    if (!data.realsense_available) {
-      const depthModeSelect = document.getElementById("topDepthMode");
-      for (let i = depthModeSelect.options.length - 1; i >= 0; i--) {
-        const val = depthModeSelect.options[i].value;
-        if (val.includes("realsense")) {
-          depthModeSelect.remove(i);
-        }
-      }
-    }
-  } catch (err) {
-    console.warn("Could not fetch camera_info:", err);
-  }
+let localStream       = null;
+let uploadedImageData = "";
+let depthInterval     = null;
+
+/****************************************************
+ * 0) On Page Load => set up depth dropdown
+ ****************************************************/
+window.addEventListener("DOMContentLoaded", () => {
+  updateDepthDropdown();
+  document.getElementById("sideCamModeSelect").dispatchEvent(new Event("change"));
 });
 
 /****************************************************
- * 1) Side Camera Stream from Browser
+ * 1) Side Camera (Window1) => "camera" or "image"
  ****************************************************/
-let localStream = null;
-const sideVideo = document.getElementById("sideVideo");
-(async function(){
+const sideCamModeSelect = document.getElementById("sideCamModeSelect");
+const sideVideo         = document.getElementById("sideVideo");
+const sideImage         = document.getElementById("sideImage");
+const uploadButton      = document.getElementById("uploadButton");
+const fileUploadInput   = document.getElementById("fileUploadInput");
+const sideCamContainer  = document.getElementById("sideCamContainer");
+
+sideCamModeSelect.addEventListener("change", () => {
+  const mode = sideCamModeSelect.value;
+
+  if (mode === "camera") {
+    // Stop camera if running (just to be safe)
+    stopSideCam();
+    // Start camera
+    startSideCam();
+
+    // Show the video, hide the image/upload
+    sideVideo.style.display = "block";
+    sideImage.style.display = "none";
+    uploadButton.style.display = "none";
+  }
+  else {
+    // "image"
+    stopSideCam();  // Stop camera feed
+
+    // Show an uploaded image if we have one, otherwise show the upload overlay
+    if (uploadedImageData) {
+      sideImage.style.display = "block";
+      sideImage.src = uploadedImageData;
+      uploadButton.style.display = "none";
+    } else {
+      sideImage.style.display = "none";
+      uploadButton.style.display = "flex";
+    }
+
+    sideVideo.style.display = "none";
+  }
+
+  // Refresh depth dropdown since it depends on "camera" vs "image"
+  updateDepthDropdown();
+});
+
+/** Start the side camera feed. */
+async function startSideCam() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, frameRate: 20 },
+      video: { width:1280, height:720, frameRate:20 },
       audio: false
     });
     sideVideo.srcObject = localStream;
-  } catch(err){
+
+    // Also mirror to Seg window if segMode is active
+    if (segMode.value === "seg") {
+      segVideo.srcObject = localStream;
+    }
+  } catch(err) {
     console.error("Camera error:", err);
   }
-})();
+}
 
-function captureSideFrame(){
+/** Stop the side camera feed. */
+function stopSideCam() {
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+  }
+  localStream = null;
+  // Also remove the segVideo stream if any
+  segVideo.srcObject = null;
+}
+
+// Upload logic
+uploadButton.addEventListener("click", () => fileUploadInput.click());
+fileUploadInput.addEventListener("change", ev => {
+  if (ev.target.files.length > 0) {
+    const f = ev.target.files[0];
+    readAndSetImage(f);
+  }
+});
+sideCamContainer.addEventListener("dragover", e => {
+  e.preventDefault();
+  e.stopPropagation();
+  sideCamContainer.style.border = "2px dashed #4af";
+});
+sideCamContainer.addEventListener("dragleave", e => {
+  e.preventDefault();
+  e.stopPropagation();
+  sideCamContainer.style.border = "none";
+});
+sideCamContainer.addEventListener("drop", e => {
+  e.preventDefault();
+  e.stopPropagation();
+  sideCamContainer.style.border = "none";
+  if (sideCamModeSelect.value === "image") {
+    const files = e.dataTransfer.files;
+    if (files.length > 0) readAndSetImage(files[0]);
+  }
+});
+
+function readAndSetImage(file) {
+  const rdr = new FileReader();
+  rdr.onload = (evt) => {
+    uploadedImageData = evt.target.result; // dataURL
+    sideImage.src      = uploadedImageData;
+    sideImage.style.display = "block";
+    uploadButton.style.display = "none";
+
+    // If segMode is "seg" and no freeze, show it there too
+    if (segMode.value === "seg" && !segFrozen) {
+      segImg.src = uploadedImageData;
+    }
+
+    // If Depth is set to "image_depth", run that logic
+    if (depthMode.value === "image_depth") {
+      processImageDepth();
+    }
+  };
+  rdr.readAsDataURL(file);
+}
+
+/****************************************************
+ * 2) Segmentation (Window2)
+ ****************************************************/
+const segMode      = document.getElementById("segMode");
+const segVideo     = document.getElementById("segVideo");
+const segImg       = document.getElementById("segImg");
+const segContainer = document.getElementById("segContainer");
+
+let segFrozen    = false;
+let isSegmenting = false;
+
+/* On segMode change */
+segMode.addEventListener("change", () => {
+  if (segMode.value === "seg") {
+    segFrozen = false;
+    // If we have a live camera feed, mirror it
+    if (localStream && sideCamModeSelect.value === "camera") {
+      segVideo.srcObject = localStream;
+      segVideo.style.display = "block";
+      segImg.style.display   = "none";
+    }
+    // If we are in image mode but have an uploaded image => show it
+    else if (sideCamModeSelect.value === "image" && uploadedImageData) {
+      segFrozen = false;
+      segVideo.style.display = "none";
+      segImg.style.display   = "block";
+      segImg.src = uploadedImageData;
+    }
+  }
+  else {
+    // "off"
+    segFrozen = false;
+    segVideo.style.display = "none";
+    segImg.style.display   = "none";
+    segImg.src = "https://via.placeholder.com/320x180?text=Seg";
+    segVideo.srcObject = null;
+  }
+});
+
+/**
+ * Two-click approach:
+ *   - First click in "seg" => freeze image, run SAM
+ *   - Second click => revert to live feed (camera) or original uploaded image
+ */
+segContainer.addEventListener("click", async (ev) => {
+  // Only if segMode is "seg"
+  if (segMode.value !== "seg") return;
+  if (isSegmenting) return; // ignore if mid-request
+  if (ev.target === segMode) return; // ignore clicks on the dropdown
+
+  // If not frozen => freeze now + run SAM
+  if (!segFrozen) {
+    segFrozen = true;
+    isSegmenting = true;
+
+    segVideo.style.display = "none";
+    segImg.style.display   = "block";
+
+    try {
+      // 1) Capture from whichever is currently visible
+      let freezeB64;
+      if (sideCamModeSelect.value === "camera" && localStream) {
+        // capture the segVideo
+        freezeB64 = await captureVideoFrame(segVideo);
+        segImg.src = "data:image/jpeg;base64," + freezeB64;
+      } else {
+        // We are in image mode => just use the uploaded image
+        // (which is already displayed in segImg)
+        freezeB64 = segImg.src.split(",")[1]; 
+      }
+
+      // 2) Get click coords
+      const rect = segContainer.getBoundingClientRect();
+      const nx = (ev.clientX - rect.left) / rect.width;
+      const ny = (ev.clientY - rect.top ) / rect.height;
+
+      // 3) Send to SAM
+      const resp = await fetch("/process_seg", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          frame: freezeB64,
+          clicked_x: nx,
+          clicked_y: ny
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        segImg.src = "data:image/jpeg;base64," + data.frame;
+      }
+    } catch (err) {
+      console.error("Seg error:", err);
+    } finally {
+      isSegmenting = false;
+    }
+  }
+  else {
+    // Already frozen => second click => revert
+    segFrozen = false;
+
+    if (sideCamModeSelect.value === "camera" && localStream) {
+      // Show live video again
+      segVideo.style.display = "block";
+      segVideo.srcObject = localStream;
+      segImg.style.display   = "none";
+    } else {
+      // We are in "image" mode => show the original image again
+      segVideo.style.display = "none";
+      segImg.style.display   = "block";
+      segImg.src = uploadedImageData || "https://via.placeholder.com/320x180?text=Seg";
+    }
+  }
+});
+
+/* Helper: capture current <video> frame => base64 */
+function captureVideoFrame(videoEl) {
   return new Promise((resolve, reject) => {
     try {
-      const canvas = document.createElement("canvas");
-      canvas.width = sideVideo.videoWidth;
-      canvas.height = sideVideo.videoHeight;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(sideVideo, 0, 0, canvas.width, canvas.height);
-      const b64 = canvas.toDataURL("image/jpeg").split(",")[1];
+      const c = document.createElement("canvas");
+      c.width  = videoEl.videoWidth;
+      c.height = videoEl.videoHeight;
+      c.getContext("2d").drawImage(videoEl, 0, 0);
+      const b64 = c.toDataURL("image/jpeg").split(",")[1];
       resolve(b64);
     } catch (e) {
       reject(e);
@@ -210,137 +465,171 @@ function captureSideFrame(){
 }
 
 /****************************************************
- * 2) Segmentation (unchanged)
+ * 3) Depth (Window3)
  ****************************************************/
-let segLoop = false;
-document.getElementById("topSegMode").addEventListener("change", function(){
-  segLoop = (this.value === "seg");
-  if (segLoop) runSegLoop();
+const depthMode = document.getElementById("depthMode");
+const depthImg  = document.getElementById("depthImg");
+
+/** Populate the dropdown depending on "camera" or "image" mode. */
+function updateDepthDropdown() {
+  if (sideCamModeSelect.value === "camera") {
+    depthMode.innerHTML = `
+      <option value="off">Off</option>
+      <option value="sidecam_depth">SideCam DepthAnything</option>
+      <option value="other">Other (Inverse)</option>
+    `;
+  } else {
+    // "image"
+    depthMode.innerHTML = `
+      <option value="off">Off</option>
+      <option value="image_depth">Image Depth Anything</option>
+    `;
+  }
+}
+
+/** Listen for changes => start/stop looping or single-call. */
+depthMode.addEventListener("change", () => {
+  stopDepthLoop(); // stop any ongoing loop
+  depthImg.src = "https://via.placeholder.com/320x180?text=Depth";
+
+  const v = depthMode.value;
+  if (v === "off") {
+    // Let server know to stop or ignore depth
+    fetch("/process_depth", {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ camera_mode:"off" })
+    });
+  }
+  else if (sideCamModeSelect.value === "camera") {
+    // If we are in camera mode and pick something like "sidecam_depth" => loop
+    startDepthLoop(v);
+  }
+  else {
+    // If we are in "image" mode with "image_depth" => single call
+    processImageDepth();
+  }
 });
-async function runSegLoop(){
-  if (!segLoop) return;
+
+/**
+ * startDepthLoop: continuously capture from sideVideo 
+ * and call /process_depth with local_idx=0
+ */
+function startDepthLoop(cameraMode) {
+  stopDepthLoop();
+  depthInterval = setInterval(async () => {
+    try {
+      const b64 = await captureSideFrame();
+      const resp = await fetch("/process_depth", {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({
+          camera_mode: cameraMode,     // e.g. "sidecam_depth"
+          local_idx: 0,               // server expects an integer
+          frame: b64
+        })
+      });
+      if (!resp.ok) throw new Error("Depth error: " + resp.status);
+      const data = await resp.json();
+      if (data.frame) {
+        depthImg.src = "data:image/jpeg;base64," + data.frame;
+      }
+    } catch(e){
+      console.error("Depth loop error:", e);
+    }
+  }, 500);
+}
+
+/**
+ * stopDepthLoop: clear the interval
+ */
+function stopDepthLoop() {
+  if (depthInterval) {
+    clearInterval(depthInterval);
+    depthInterval = null;
+  }
+}
+
+/**
+ * processImageDepth: single call for "image_depth" 
+ * whenever user has uploaded a new image (or changes the dropdown).
+ */
+async function processImageDepth() {
   try {
     const b64 = await captureSideFrame();
-    const resp = await fetch("/process_seg", {
-      method:"POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ frame: b64 })
-    });
-    if (!resp.ok) throw new Error("Seg error:" + resp.status);
-    const data = await resp.json();
-    document.getElementById("topSegImg").src = "data:image/jpeg;base64," + data.frame;
-  } catch(err){
-    console.error(err);
-  }
-  if (segLoop) setTimeout(runSegLoop, 500);
-}
-document.getElementById("topSegImg").addEventListener("click", function(ev){
-  if (!segLoop) return;
-  const rect = this.getBoundingClientRect();
-  const nx = (ev.clientX - rect.left) / rect.width;
-  const ny = (ev.clientY - rect.top) / rect.height;
-  captureSideFrame().then(async b64 => {
-    const r = await fetch("/process_seg", {
-      method:"POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ frame: b64, clicked_x: nx, clicked_y: ny })
-    });
-    if (!r.ok) throw new Error("Seg click error");
-    const d = await r.json();
-    document.getElementById("topSegImg").src = "data:image/jpeg;base64," + d.frame;
-  }).catch(err => console.error(err));
-});
-
-/****************************************************
- * 3) Depth Handling: Polling /process_depth
- ****************************************************/
-let depthLoop = false;
-document.getElementById("topDepthMode").addEventListener("change", function(){
-  if (this.value === "off"){
-    depthLoop = false;
-    fetch("/process_depth", {
-      method:"POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ camera_mode: "off" })
-    });
-  } else {
-    depthLoop = true;
-    runDepthLoop();
-  }
-});
-async function runDepthLoop(){
-  if (!depthLoop) return;
-  try {
-    const modeVal = document.getElementById("topDepthMode").value;
-    let b64 = "";
-    if (modeVal === "default_anything" || modeVal === "other"){
-      b64 = await captureSideFrame();
-    }
     const resp = await fetch("/process_depth", {
-      method:"POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ camera_mode: modeVal, local_idx: 0, frame: b64 })
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({
+        camera_mode: "image_depth",
+        local_idx: 0,
+        frame: b64
+      })
     });
-    if (!resp.ok) throw new Error("Depth error:" + resp.status);
+    if (!resp.ok) throw new Error("Depth error: " + resp.status);
     const data = await resp.json();
-    if (data.error) console.log("[Depth] error =>", data.error);
     if (data.frame) {
-      document.getElementById("topDepthImg").src = "data:image/jpeg;base64," + data.frame;
+      depthImg.src = "data:image/jpeg;base64," + data.frame;
     }
-  } catch(err) {
-    console.error("Depth error:", err);
+  } catch(e){
+    console.error("Image depth error:", e);
   }
-  if (depthLoop) setTimeout(runDepthLoop, 500);
 }
 
 /****************************************************
- * 4) Chat Functionality
+ * 4) Chat (Window4)
  ****************************************************/
 const chatMessages = document.getElementById("chatMessages");
-const chatInput = document.getElementById("chatInput");
-const chatSendBtn = document.getElementById("sendChatBtn");
+const chatInput    = document.getElementById("chatInput");
+const chatSendBtn  = document.getElementById("chatSendBtn");
+
 chatSendBtn.addEventListener("click", () => sendChat());
-chatInput.addEventListener("keyup", (e) => {
-  if(e.key === "Enter") sendChat();
+chatInput.addEventListener("keyup",(e) => { 
+  if (e.key === "Enter") sendChat();
 });
+
 function addChatMessage(sender, msg) {
-  if (chatMessages.children.length >= 1000)
+  if (chatMessages.children.length >= 1000) {
     chatMessages.removeChild(chatMessages.firstChild);
-  const div = document.createElement("div");
-  div.innerHTML = `<strong>${sender}:</strong> ${msg}`;
-  chatMessages.appendChild(div);
+  }
+  const dv = document.createElement("div");
+  dv.innerHTML = `<strong>${sender}:</strong> ${msg}`;
+  chatMessages.appendChild(dv);
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
-async function sendChat(customText){
-  let userText = customText || chatInput.value.trim();
-  if(!userText) return;
+
+async function sendChat(customText) {
+  const userText = customText || chatInput.value.trim();
+  if (!userText) return;
   chatInput.value = "";
   addChatMessage("You", userText);
+
   try {
-    const resp = await fetch("/chat", {
-      method:"POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ text: userText })
+    const r = await fetch("/chat", {
+      method:"POST", 
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ text:userText })
     });
-    if (!resp.ok) throw new Error("Chat fail:" + resp.status);
-    const data = await resp.json();
-    addChatMessage("AAU Agent", data.reply);
-  } catch(err){
+    if (!r.ok) throw new Error("Chat fail:" + r.status);
+    const d = await r.json();
+    addChatMessage("AAU Agent", d.reply);
+  } catch(err) {
     console.error(err);
-    addChatMessage("AAU Agent", "Error:" + err.toString());
+    addChatMessage("AAU Agent","Error:" + err.toString());
   }
 }
 
 /****************************************************
- * 5) LLM Reasoning Console
+ * 5) LLM Reasoning (Window7)
  ****************************************************/
 const llmConsole = document.getElementById("llmConsole");
-function logToConsole(msg) {
-  if(llmConsole.children.length >= 1000)
+function logToConsole(msg){
+  if (llmConsole.children.length >= 1000){
     llmConsole.removeChild(llmConsole.firstChild);
-  const d = document.createElement("div");
-  d.textContent = msg;
-  llmConsole.appendChild(d);
+  }
+  const dv = document.createElement("div");
+  dv.textContent = msg;
+  llmConsole.appendChild(dv);
   llmConsole.scrollTop = llmConsole.scrollHeight;
 }
 </script>

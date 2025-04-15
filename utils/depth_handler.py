@@ -1,3 +1,4 @@
+# depth_handler.py
 import numpy as np
 import cv2
 from PIL import Image
@@ -140,12 +141,14 @@ class DepthHandler:
     def realsense_color_to_depthanything(self):
         """
         Capture RealSense RGB, convert to PIL, and run Depth Anything.
-        Returns resulting PIL image or None.
+        Returns resulting PIL image or None if frames are not ready.
         """
         color_arr, _ = self.get_realsense_frames()
         if color_arr is None:
             return None
-        pil_img = Image.fromarray(color_arr[..., ::-1])  # Convert BGR to RGB
+        # color_arr is BGR from RealSense? Typically it's actually already RGB
+        # but if it's not, you can do color_arr[..., ::-1].
+        pil_img = Image.fromarray(color_arr)
         return self.run_depth_anything(pil_img)
 
     def realsense_depth_colormap(self):
