@@ -168,6 +168,15 @@ class DepthHandler:
         ok, frame = self.local_cap.read()
         return frame if ok else None
 
+    def run_depth_anything(self, pil_img: Image.Image) -> Image.Image:
+        depth_out   = self.depth_anything(pil_img)
+        depth_arr   = np.array(depth_out["depth"], dtype=np.float32)
+        depth_norm  = cv2.normalize(depth_arr, None, 0, 255, cv2.NORM_MINMAX).astype(
+            np.uint8
+        )
+        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+        return Image.fromarray(depth_color[..., ::-1])
+
     def calculate_object_info(self, mask_bool: np.ndarray, depth_arr: np.ndarray):
         import numpy as np, cv2, pyrealsense2 as rs
 
