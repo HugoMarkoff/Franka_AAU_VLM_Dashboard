@@ -19,7 +19,7 @@ from utils.robopoints_handler import RoboPointsHandler
 app = Flask(__name__)
 CORS(app)
 
-REMOTE_POINTS_ENDPOINT = "https://95be-130-225-198-197.ngrok-free.app/predict"
+REMOTE_POINTS_ENDPOINT = "https://23f4-130-225-198-197.ngrok-free.app/predict"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Using device: {device}")
 
@@ -142,22 +142,31 @@ def move_active_cross(direction, dist=1):
     coords[idx] = (nx, ny)
     g_state["points_str"] = "[" + ", ".join(f"({c[0]:.3f}, {c[1]:.3f})" for c in coords) + "]"
 
-def draw_points_on_image(pil_img, points_str, active_idx=-1):
+def draw_points_on_image(pil_img, points_str, active_idx=0, only_active=False):
+    """
+    Draws crosses on pil_img at the normalized points in points_str.
+    If only_active=True, only the active_idx point is drawn (in blue).
+    """
     matches = re.findall(r"\(([0-9.]+),\s*([0-9.]+)\)", points_str)
     coords = [(float(a), float(b)) for a, b in matches]
     if not coords:
         print("[DEBUG] No coordinates found in points_str. Returning original image.")
         return pil_img
-    print(f"[DEBUG] Drawing crosses overlay on image with coordinates: {coords}")
+
+    print(f"[DEBUG] Drawing crosses overlay (only_active={only_active}) at idx={active_idx} over coords: {coords}")
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     h, w, _ = cv_img.shape
+
     for i, (nx, ny) in enumerate(coords):
+        if only_active and i != active_idx:
+            continue
         px = int(nx * w)
         py = int(ny * h)
-        # Draw cross: black for normal points, red for the active one.
-        color = (0, 0, 0) if i != active_idx else (255, 0, 0)
+        # blue cross in BGR
+        color = (255, 0, 0)
         cv2.line(cv_img, (px-10, py-10), (px+10, py+10), color, 2)
         cv2.line(cv_img, (px+10, py-10), (px-10, py+10), color, 2)
+
     return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
 ###########################
@@ -182,145 +191,164 @@ def camera_info():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.json
-    text = data.get("text", "").strip().lower()
+    """
+    Stage 1 (“rgb” mode)   : talk to remote AI to get candidate points.
+    Stage 2 (“confirm” mode): user types ‘yes’ or something else.
+                              If ‘yes’ we FINALISE and also return object_info.
+    """
+    data  = request.json or {}
+    text  = data.get("text", "").strip().lower()
     global g_last_raw_frame
 
-    reply = ""
-    # Stage 1: (RGB mode) Capture seg frame, get candidate points, and overlay them on the raw RGB frame.
+    # ------------------------------------------------------------------
+    #  STAGE 1  Get candidate points from remote AI
+    # ------------------------------------------------------------------
     if g_state["mode"] == "rgb":
-        # Expect these fields from the client:
-        seg_input = data.get("seg_input", "on")   # (e.g., "on" or "off" from the seg dropdown)
-        seg_frame = data.get("seg_frame", None)     # Base64 captured seg window frame
-        
-        # Call helper to get candidate points from the remote endpoint.
-        candidate_points = get__current_frame(seg_input, seg_frame, text)
-        if ("no segmentation frame available" in candidate_points.lower() or
-            "failed to decode" in candidate_points.lower() or
-            "seg window input is off" in candidate_points.lower()):
-            reply = candidate_points
-            return jsonify({"reply": reply})
-        
-        # Now, instead of processing through Depth Anything, simply use the raw RGB image.
-        try:
-            pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
-            # Overlay the candidate points onto the raw RGB image.
-            candidate_overlay = (
-                draw_points_on_image(pil_img, candidate_points, 0)
-                if candidate_points else pil_img
-            )
-            candidate_overlay_b64 = pil_to_b64(candidate_overlay)
-            print("[DEBUG] Candidate overlay image prepared from raw RGB frame with candidate points frozen.")
-        except Exception as e:
-            error_msg = f"Error processing candidate overlay image: {e}"
-            print("[ERROR]", error_msg)
-            return jsonify({"reply": error_msg})
-        
-        # Save candidate points and switch to confirm mode.
-        g_state["points_str"] = candidate_points
-        g_state["active_cross_idx"] = 0
-        g_state["mode"] = "confirm"
-        reply = (f"Found points: {candidate_points}\n"
-                 "Displaying best candidate (from RGB image) on SEG window – confirm?")
-        return jsonify({"reply": reply, "seg_frame": candidate_overlay_b64})
-    
-    # Stage 2: (Confirm mode) Wait for user confirmation to run SAM.
+        seg_input  = data.get("seg_input", "on")
+        seg_frame  = data.get("seg_frame", None)
+        candidate  = get__current_frame(seg_input, seg_frame, text)   # calls remote AI
+
+        # Error handling
+        lowered = candidate.lower()
+        if ("no segmentation frame available" in lowered or
+            "failed to decode" in lowered or
+            "seg window input is off" in lowered):
+            return jsonify({"reply": candidate})
+
+        # Draw overlay with ONLY the first (blue) cross
+        pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
+        raw_b64 = pil_to_b64(pil_img)
+        overlay = (
+            draw_points_on_image(pil_img, candidate, active_idx=0, only_active=True)
+            if candidate else pil_img
+        )
+        overlay_b64 = pil_to_b64(overlay)
+
+        # Switch to confirm mode
+        g_state.update({
+            "mode"       : "confirm",
+            "points_str" : candidate
+        })
+
+        return jsonify({
+            "reply"        : candidate,
+            "raw_frame"    : raw_b64,
+            "overlay_frame": overlay_b64
+        })
+
+    # ------------------------------------------------------------------
+    #  STAGE 2  User replies while in “confirm” mode
+    # ------------------------------------------------------------------
     elif g_state["mode"] == "confirm":
-        if text in ["yes", "y"]:
-            # Extract candidate point coordinates from the points string.
-            candidate_coords = re.findall(r"\(([0-9.]+),\s*([0-9.]+)\)", g_state["points_str"])
-            if candidate_coords:
-                best_x, best_y = map(float, candidate_coords[0])
-            else:
-                best_x, best_y = 0.5, 0.5  # Default to center if none found.
-            try:
-                pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
-                # Run SAM as if the user had clicked at the best candidate point.
-                sam_output = sam_handler.run_sam_overlay(pil_img, [(best_x, best_y)], active_idx=0, max_dim=640)
-                final_overlay = (
-                    draw_points_on_image(sam_output, g_state["points_str"], g_state["active_cross_idx"])
-                    if g_state["points_str"] else sam_output
-                )
-                final_seg_b64 = pil_to_b64(final_overlay)
-            except Exception as e:
-                return jsonify({"reply": f"Error running SAM: {e}"})
-            g_state["mode"] = "rgb"  # Return to RGB mode for the next command.
-            reply = "Segmentation confirmed. Returning to RGB mode."
-            return jsonify({"reply": reply, "seg_frame": final_seg_b64})
+        if text in ("yes", "y"):
+            # --- a) run SAM at best point --------------------------------
+            coords = re.findall(r"\(([0-9.]+),\s*([0-9.]+)\)", g_state["points_str"])
+            bx, by = map(float, coords[0]) if coords else (0.5, 0.5)
+
+            pil_img   = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
+            final_seg = sam_handler.run_sam_overlay(
+                pil_img, [(bx, by)], active_idx=0, max_dim=640
+            )
+            final_b64 = pil_to_b64(final_seg)
+
+            # --- b) depth geometry --------------------------------------
+            object_info = None
+            if depth_handler.start_realsense():
+                _, depth_arr = depth_handler.get_realsense_frames()
+                mask_bool    = sam_handler.get_last_mask()
+                object_info  = depth_handler.calculate_object_info(mask_bool, depth_arr)
+
+            # --- c) reset state & return --------------------------------
+            g_state.update({"mode":"rgb", "points_str":""})
+            return jsonify({
+                "reply"       : "Segmentation confirmed.",
+                "seg_frame"   : final_b64,
+                "object_info" : object_info
+            })
+
         else:
-            reply = "Candidate not confirmed. Please adjust your command and try again."
-            return jsonify({"reply": reply})
-    
-    # (Legacy branches for depth and sam can remain unchanged.)
-    elif g_state["mode"] == "depth":
-        if text in ["yes", "y"]:
-            g_state["mode"] = "sam"
-            reply = "Confirmed points => switching to SAM mode."
-        elif text in ["no", "n"]:
-            reply = "Staying in Depth mode."
-        else:
-            m = re.search(r"^(\d+)\s*to\s*the\s*(left|right|up|down)$", text)
-            if m:
-                dist = int(m.group(1))
-                direction = m.group(2)
-                move_active_cross(direction, dist)
-                reply = f"Moved active cross {dist} to the {direction}."
-            else:
-                reply = "Depth mode: type yes/no or movement commands."
-        return jsonify({"reply": reply})
-    
-    elif g_state["mode"] == "sam":
-        if text in ["yes", "y"]:
-            g_state["points_str"] = ""
-            g_state["mode"] = "rgb"
-            reply = "Segmentation confirmed, returning to RGB mode."
-        elif text in ["no", "n"]:
-            reply = "Staying in SAM mode."
-        else:
-            m = re.search(r"^(\d+)\s*to\s*the\s*(left|right|up|down)$", text)
-            if m:
-                dist = int(m.group(1))
-                direction = m.group(2)
-                move_active_cross(direction, dist)
-                reply = f"Moved cross {dist} to the {direction}."
-            else:
-                reply = "SAM mode: type yes/no or movement commands."
-        return jsonify({"reply": reply})
-    else:
-        reply = f"Unknown mode: {g_state['mode']}"
-        return jsonify({"reply": reply})
+            # User rejected – reset and allow new question
+            g_state.update({"mode":"rgb", "points_str":""})
+            return jsonify({"reply": "Candidate not confirmed. Returning to RGB mode."})
+
+    # ------------------------------------------------------------------
+    #  Unknown mode fallback
+    # ------------------------------------------------------------------
+    return jsonify({"reply": f"Unknown mode: {g_state['mode']}"})
 
 @app.route("/process_seg", methods=["POST"])
 def process_seg_endpoint():
-    global g_last_raw_frame  # Declare the global variable
-    data = request.json
+    """
+    FIRST CLICK  (freeze):
+        • Runs SAM at the click → green mask
+        • Computes 3-D centre / distance / W×H immediately (RealSense)
+        • Returns overlay image + object_info
+
+    SECOND CLICK (unfreeze):
+        • Resets segmentation state (handled client-side with /reset_seg)
+    """
+    global g_last_raw_frame
+
+    # ---------- 0  decode incoming frame ----------
+    data      = request.json or {}
     frame_b64 = data.get("frame", "")
     if not frame_b64:
         return jsonify({"frame": ""})
-    
-    # Decode the incoming frame and update the global seg frame.
-    raw_bytes = base64.b64decode(frame_b64)
-    g_last_raw_frame = raw_bytes  
-    pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    
+
+    raw_bytes        = base64.b64decode(frame_b64)
+    g_last_raw_frame = raw_bytes
+    pil_img          = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
     clicked_x = data.get("clicked_x")
     clicked_y = data.get("clicked_y")
-    
-    if clicked_x is not None and clicked_y is not None:
-        # When a click is provided, run SAM on the original seg frame.
-        click_coords = (float(clicked_x), float(clicked_y))
-        sam_output = sam_handler.run_sam_overlay(pil_img, [click_coords], active_idx=0, max_dim=640)
-        # Overlay robot points on the SAM output (if any) and use that as final output.
-        output_img = draw_points_on_image(sam_output, g_state["points_str"], g_state["active_cross_idx"]) if g_state["points_str"] else sam_output
-    else:
-        # Otherwise, process the raw seg frame through Depth Anything;
-        # This gives you a static depth-processed image (with best selected point in blue).
-        depth_processed = depth_handler.run_depth_anything(pil_img)
-        # Now overlay the robot-selected crosses onto this processed image.
-        output_img = draw_points_on_image(depth_processed, g_state["points_str"], g_state["active_cross_idx"]) if g_state["points_str"] else depth_processed
 
+    # ------------------------------------------------------------------
+    # 1  SEGMENTATION PATH  (user clicked inside the image)
+    # ------------------------------------------------------------------
+    if clicked_x is not None and clicked_y is not None:
+        click_coords = (float(clicked_x), float(clicked_y))
+
+        # 1-a  SAM mask & overlay
+        sam_img = sam_handler.run_sam_overlay(
+            pil_img, [click_coords], active_idx=0, max_dim=640
+        )
+
+        # 1-b  Depth-based geometry (if RealSense available)
+        object_info = None
+        if depth_handler.start_realsense():                     # no-op if already started
+            _, depth_arr = depth_handler.get_realsense_frames()
+            mask_bool    = sam_handler.get_last_mask()
+            object_info  = depth_handler.calculate_object_info(mask_bool, depth_arr)
+
+        # 1-c  Optional blue crosses (robot candidate points)
+        output_img = (
+            draw_points_on_image(
+                sam_img, g_state["points_str"], g_state["active_cross_idx"]
+            )
+            if g_state["points_str"]
+            else sam_img
+        )
+
+    # ------------------------------------------------------------------
+    # 2  DEPTH-ANYTHING PATH  (no click, e.g. RealSense RGB stream)
+    # ------------------------------------------------------------------
+    else:
+        object_info     = None
+        depth_processed = depth_handler.run_depth_anything(pil_img)
+        output_img      = (
+            draw_points_on_image(
+                depth_processed, g_state["points_str"], g_state["active_cross_idx"]
+            )
+            if g_state["points_str"]
+            else depth_processed
+        )
+
+    # ---------- 3  send back frame (+ geometry) ----------
     out_b64 = pil_to_b64(output_img)
-    return jsonify({"frame": out_b64})
+    return jsonify({
+        "frame"       : out_b64,
+        "object_info" : object_info       # may be None
+    })
 
 @app.route("/process_realsense_seg", methods=["POST"])
 def process_realsense_seg():
@@ -414,6 +442,17 @@ def process_depth():
 
     else:
         return jsonify({"error": f"Unknown camera_mode: {mode}"}), 400
+    
+@app.route("/reset_seg", methods=["POST"])
+def reset_seg():
+    """
+    Reset segmentation state (abort any pending confirm),
+    clear all points, and return to RGB mode.
+    """
+    g_state["mode"] = "rgb"
+    g_state["points_str"] = ""
+    g_state["active_cross_idx"] = 0
+    return jsonify({"status": "reset"})
 
 if __name__ == "__main__":
     print("[INFO] Starting on :5000 in multi-threaded mode.")

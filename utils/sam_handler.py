@@ -29,78 +29,76 @@ class SamHandler:
         seg_img = self.run_sam_overlay(pil_img, [click_coords], active_idx=0, max_dim=max_dim)
         return seg_img
 
-    def run_sam_overlay(self, pil_img, coords, active_idx=0, max_dim=640):
+    ####################################################################
+    # SAM → green overlay  + store Boolean mask
+    ####################################################################
+    def run_sam_overlay(self, pil_img, coords, active_idx: int = 0, max_dim: int = 640):
         """
-        Run SAM on a downscaled image using the active normalized coordinate.
+        Run SAM on the given point, colour the mask green, dim the rest,
+        and remember the Boolean mask for depth processing.
         """
+        import time, cv2, numpy as np
         t0 = time.time()
 
-        if not coords or active_idx < 0 or active_idx >= len(coords):
-            return pil_img  # no valid points provided
+        if not coords or not (0 <= active_idx < len(coords)):
+            return pil_img
 
-        # Convert PIL image to NumPy array.
-        np_img = np.array(pil_img)
+        np_img  = np.array(pil_img)
         orig_h, orig_w, _ = np_img.shape
 
-        # Downscale if needed.
-        scale = 1.0
+        # ---------- down-scale if necessary ----------
         if max(orig_w, orig_h) > max_dim:
-            scale = max_dim / max(orig_w, orig_h)
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            pil_img_small = pil_img.resize((new_w, new_h), Image.BILINEAR)
-            np_img_small = np.array(pil_img_small)
+            scale   = max_dim / max(orig_w, orig_h)
+            new_w   = int(orig_w * scale)
+            new_h   = int(orig_h * scale)
+            np_small = np.array(pil_img.resize((new_w, new_h), Image.BILINEAR))
         else:
             new_w, new_h = orig_w, orig_h
-            pil_img_small = pil_img
-            np_img_small = np_img
+            np_small     = np_img
 
-        # Map the active normalized coordinate to the downscaled image.
-        (nx, ny) = coords[active_idx]
-        px_small = int(nx * new_w)
-        py_small = int(ny * new_h)
+        # ---------- active point in small space -------
+        nx, ny = coords[active_idx]
+        px_s   = int(nx * new_w)
+        py_s   = int(ny * new_h)
 
-        # Set the predictor with the small image.
-        self.predictor.set_image(np_img_small)
-        self.cached_image_shape = np_img_small.shape
-        self.cached_image = np_img_small.copy()
-
-        const_point_coords = np.array([[px_small, py_small]], dtype=np.float32)
-        const_point_labels = np.array([1], dtype=np.int64)
-
+        # ---------- SAM inference ---------------------
+        self.predictor.set_image(np_small)
         with torch.no_grad():
-            masks, scores, logits = self.predictor.predict(
-                point_coords=const_point_coords,
-                point_labels=const_point_labels
+            masks, _, _ = self.predictor.predict(
+                point_coords = np.array([[px_s, py_s]], dtype=np.float32),
+                point_labels = np.array([1],         dtype=np.int64)
             )
         if masks is None or len(masks) == 0:
             return pil_img
 
-        # Resize the segmentation mask back to original dimensions.
-        mask_small = masks[0]
-        mask_orig = cv2.resize(mask_small.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        mask_orig = mask_orig.astype(bool)
+        # ---------- resize mask to full resolution ----
+        mask_small     = masks[0].astype(np.uint8)
+        mask_bool_full = cv2.resize(
+            mask_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
 
-        # Overlay the segmentation mask (with green tint) on the original image.
-        cv_img = np_img.copy()
-        for rr in range(orig_h):
-            for cc in range(orig_w):
-                if mask_orig[rr, cc]:
-                    # Blend the pixel with green color.
-                    cv_img[rr, cc] = (0.5 * cv_img[rr, cc] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
-                else:
-                    # Dim non-segmented areas slightly.
-                    cv_img[rr, cc] = (0.8 * cv_img[rr, cc]).astype(np.uint8)
+        # ---------- remember mask for depth logic -----
+        self.last_mask_bool = mask_bool_full
 
-        elapsed = time.time() - t0
-        print(f"[SAM] Inference time (with resizing): {elapsed:.3f} seconds")
+        # ---------- green overlay ---------------------
+        cv_img                  = np_img.copy()
+        cv_img[ mask_bool_full] = (
+            0.5 * cv_img[mask_bool_full] + 0.5 * np.array([0,255,0])
+        ).astype(np.uint8)
+        cv_img[~mask_bool_full] = (0.8 * cv_img[~mask_bool_full]).astype(np.uint8)
+
+        print(f"[SAM] Inference+overlay {time.time()-t0:.3f}s")
         return Image.fromarray(cv_img)
+
+    def get_last_mask(self):
+        """Return the most recent Boolean mask produced by run_sam_overlay()."""
+        return getattr(self, "last_mask_bool", None)
 
     def toggle_segmentation(self, pil_img, click_coords=None, max_dim=640):
         """
         Toggle segmentation:
-          - If segmentation is off, run SAM with the provided coordinate and cache the output.
-          - If segmentation is already active, reset and return the original live frame.
+            - If segmentation is off, run SAM with the provided coordinate and cache the output.
+            - If segmentation is already active, reset and return the original live frame.
         """
         if not self.segmentation_active:
             if click_coords is None:

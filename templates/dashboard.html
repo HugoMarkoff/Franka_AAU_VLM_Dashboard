@@ -190,574 +190,456 @@
 </div>
 
 <script>
-/****************************************************
- * GLOBALS
- ****************************************************/
-let localStream       = null;
-let uploadedImageData = "";
-let depthInterval     = null;
-
-/****************************************************
- * ON PAGE LOAD: fetch camera_info, then set up
- ****************************************************/
-window.addEventListener("DOMContentLoaded", async () => {
-  try {
-    const resp = await fetch("/camera_info");
-    if (!resp.ok) throw new Error("camera_info error: " + resp.status);
-    const info = await resp.json();
-    console.log("[camera_info]", info);
-
-    // If RealSense is not available, remove RealSense options from Depth dropdown once we build it
-    // We'll do that in updateDepthDropdown after we see sideCamModeSelect's value.
-    window.realsenseAvailable = info.realsense_available === true;
-  } catch (err) {
-    console.warn("Could not fetch camera_info:", err);
-    window.realsenseAvailable = false; // fallback
-  }
-
-  updateDepthDropdown(); // build the initial dropdown
-  document.getElementById("sideCamModeSelect").dispatchEvent(new Event("change"));
-});
-
-/****************************************************
- * 1) Side Camera (Window1) => "camera" or "image"
- ****************************************************/
-const sideCamModeSelect = document.getElementById("sideCamModeSelect");
-const sideVideo         = document.getElementById("sideVideo");
-const sideImage         = document.getElementById("sideImage");
-const uploadButton      = document.getElementById("uploadButton");
-const fileUploadInput   = document.getElementById("fileUploadInput");
-const sideCamContainer  = document.getElementById("sideCamContainer");
-
-sideCamModeSelect.addEventListener("change", () => {
-  const mode = sideCamModeSelect.value;
-
-  if (mode === "camera") {
-    stopSideCam();
-    startSideCam();
-
-    sideVideo.style.display = "block";
-    sideImage.style.display = "none";
-    uploadButton.style.display = "none";
-  } else {
-    // "image"
-    stopSideCam();
-
-    // show user-chosen image or show "upload" overlay
-    if (uploadedImageData) {
-      sideImage.style.display = "block";
-      sideImage.src = uploadedImageData;
+  /****************************************************
+   * ELEMENT REFS
+   ****************************************************/
+  const sideCamModeSelect = document.getElementById("sideCamModeSelect");
+  const sideVideo         = document.getElementById("sideVideo");
+  const sideImage         = document.getElementById("sideImage");
+  const uploadButton      = document.getElementById("uploadButton");
+  const fileUploadInput   = document.getElementById("fileUploadInput");
+  const sideCamContainer  = document.getElementById("sideCamContainer");
+  
+  const segMode      = document.getElementById("segMode");
+  const segVideo     = document.getElementById("segVideo");
+  const segImg       = document.getElementById("segImg");
+  const segContainer = document.getElementById("segContainer");
+  
+  const depthMode = document.getElementById("depthMode");
+  const depthImg  = document.getElementById("depthImg");
+  
+  const chatMessages = document.getElementById("chatMessages");
+  const chatInput    = document.getElementById("chatInput");
+  const chatSendBtn  = document.getElementById("chatSendBtn");
+  
+  const llmConsole = document.getElementById("llmConsole");
+  
+  /****************************************************
+   * STATE
+   ****************************************************/
+  let localStream        = null;
+  let uploadedImageData  = "";
+  let segFrozen          = false;
+  let isSegmenting       = false;
+  let realsenseSegTimer  = null;
+  let depthTimer         = null;
+  
+  /****************************************************
+   * PAGE LOAD
+   ****************************************************/
+  window.addEventListener("DOMContentLoaded", async () => {
+    // fetch camera info for depth dropdown
+    try {
+      const res = await fetch("/camera_info");
+      const info = await res.json();
+      window.realsenseAvailable = info.realsense_available;
+    } catch {
+      window.realsenseAvailable = false;
+    }
+    updateDepthDropdown();
+    sideCamModeSelect.dispatchEvent(new Event("change"));
+  });
+  
+  /****************************************************
+   * SIDE CAMERA (Window1)
+   ****************************************************/
+  sideCamModeSelect.addEventListener("change", () => {
+    const mode = sideCamModeSelect.value;
+    if (mode === "camera") {
+      startSideCam();
+      sideVideo.style.display = "block";
+      sideImage.style.display = "none";
       uploadButton.style.display = "none";
     } else {
-      sideImage.style.display = "none";
-      uploadButton.style.display = "flex";
+      stopSideCam();
+      if (uploadedImageData) {
+        sideImage.src = uploadedImageData;
+        sideImage.style.display = "block";
+        uploadButton.style.display = "none";
+      } else {
+        sideImage.style.display = "none";
+        uploadButton.style.display = "flex";
+      }
+      sideVideo.style.display = "none";
     }
-
-    sideVideo.style.display = "none";
-  }
-
-  // Refresh Depth dropdown
-  updateDepthDropdown();
-});
-
-async function startSideCam() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width:1280, height:720, frameRate:20 },
-      audio: false
-    });
-    sideVideo.srcObject = localStream;
-
-    // Also mirror to Seg window if segMode is "seg"
-    if (segMode.value === "seg") {
-      segVideo.srcObject = localStream;
-    }
-  } catch(err) {
-    console.error("Camera error:", err);
-  }
-}
-function stopSideCam() {
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-  }
-  localStream = null;
-  segVideo.srcObject = null;
-}
-
-// Upload logic
-uploadButton.addEventListener("click", () => fileUploadInput.click());
-fileUploadInput.addEventListener("change", ev => {
-  if (ev.target.files.length > 0) {
-    const f = ev.target.files[0];
-    readAndSetImage(f);
-  }
-});
-sideCamContainer.addEventListener("dragover", e => {
-  e.preventDefault();
-  e.stopPropagation();
-  sideCamContainer.style.border = "2px dashed #4af";
-});
-sideCamContainer.addEventListener("dragleave", e => {
-  e.preventDefault();
-  e.stopPropagation();
-  sideCamContainer.style.border = "none";
-});
-sideCamContainer.addEventListener("drop", e => {
-  e.preventDefault();
-  e.stopPropagation();
-  sideCamContainer.style.border = "none";
-  if (sideCamModeSelect.value === "image") {
-    const files = e.dataTransfer.files;
-    if (files.length > 0) readAndSetImage(files[0]);
-  }
-});
-
-function readAndSetImage(file) {
-  const rdr = new FileReader();
-  rdr.onload = (evt) => {
-    uploadedImageData = evt.target.result;
-    sideImage.src = uploadedImageData;
-    sideImage.style.display = "block";
-    uploadButton.style.display = "none";
-
-    // If we have Seg "on" and not frozen, show it in segImg
-    if (segMode.value === "seg" && !segFrozen) {
-      segImg.src = uploadedImageData;
-    }
-
-    // If Depth is "image_depth", do a single call
-    if (depthMode.value === "image_depth") {
-      processImageDepth();
-    }
-  };
-  rdr.readAsDataURL(file);
-}
-
-/****************************************************
- * 2) Segmentation (Window2)
- ****************************************************/
-const segMode      = document.getElementById("segMode");
-const segVideo     = document.getElementById("segVideo");
-const segImg       = document.getElementById("segImg");
-const segContainer = document.getElementById("segContainer");
-
-let segFrozen    = false;
-let isSegmenting = false;
-let realsenseSegInterval = null;
-
-function startRealsenseSegLoop() {
-  stopRealsenseSegLoop();
-  // Adjust the polling interval here (250ms => approx. 4 FPS)
-  realsenseSegInterval = setInterval(async () => {
+    updateDepthDropdown();
+  });
+  
+  async function startSideCam() {
     try {
-      const resp = await fetch("/process_realsense_seg", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width:1280, height:720, frameRate:20 },
+        audio: false
       });
-      if (!resp.ok) throw new Error("Realsense seg error: " + resp.status);
-      const data = await resp.json();
-      if (data.frame) {
-        // Update segImg so that segmentation window shows the RealSense image.
-        segImg.src = "data:image/jpeg;base64," + data.frame;
+      localStream = stream;
+      sideVideo.srcObject = stream;
+      // mirror to Seg window if active
+      if (segMode.value === "seg") {
+        segVideo.srcObject = stream;
       }
     } catch (e) {
-      console.error("Realsense seg loop error:", e);
+      console.error("startSideCam:", e);
     }
-  }, 250);
-}
-
-function stopRealsenseSegLoop() {
-  if (realsenseSegInterval) {
-    clearInterval(realsenseSegInterval);
-    realsenseSegInterval = null;
   }
-}
-
-
-function stopRealsenseSegLoop() {
-  if (realsenseSegInterval) {
-    clearInterval(realsenseSegInterval);
-    realsenseSegInterval = null;
-  }
-}
-
-segMode.addEventListener("change", () => {
-  if (segMode.value === "seg") {
-    segFrozen = false;
-    // Use the standard webcam or uploaded image, as before
-    if (localStream && sideCamModeSelect.value === "camera") {
-      segVideo.srcObject = localStream;
-      segVideo.style.display = "block";
-      segImg.style.display = "none";
-    } else if (sideCamModeSelect.value === "image" && uploadedImageData) {
-      segFrozen = false;
-      segVideo.style.display = "none";
-      segImg.style.display = "block";
-      segImg.src = uploadedImageData;
+  function stopSideCam() {
+    if (localStream) {
+      localStream.getTracks().forEach(t=>t.stop());
+      localStream = null;
     }
-    stopRealsenseSegLoop();
-    } else if (segMode.value === "realsense_seg") {
-    // When using RealSense for segmentation, continue streaming the side camera in Window1
-    // but update the segmentation window to show RealSense frames.
-    segImg.style.display = "block";
-    segVideo.style.display = "none";
-    // Do NOT call stopSideCam() so that Window1 keeps streaming.
-    startRealsenseSegLoop(); // Begin fetching RealSense frames.
-  } else {
-    // "off" mode: Hide everything.
-    segFrozen = false;
-    segVideo.style.display = "none";
-    segImg.style.display = "none";
-    segImg.src = "https://via.placeholder.com/320x180?text=Seg";
     segVideo.srcObject = null;
-    stopRealsenseSegLoop();
   }
-});
-
-/**
- * Two-click approach:
- *   1) If not frozen => freeze + run SAM
- *   2) If frozen => revert
- */
- segContainer.addEventListener("click", async (ev) => {
-  if (segMode.value !== "seg" && segMode.value !== "realsense_seg") return;
-  if (isSegmenting) return;
-  if (ev.target === segMode) return;
-
-  if (!segFrozen) {
-    segFrozen = true;
-    isSegmenting = true;
-
-    // Always show segImg to display the current frame.
-    segVideo.style.display = "none";
-    segImg.style.display   = "block";
-
-    try {
-      // Capture the current frame based on the active seg mode.
-      let freezeB64 = await captureSegFrame();
-      segImg.src = "data:image/jpeg;base64," + freezeB64;
-
-      const rect = segContainer.getBoundingClientRect();
-      const nx = (ev.clientX - rect.left) / rect.width;
-      const ny = (ev.clientY - rect.top) / rect.height;
-
-      const r = await fetch("/process_seg", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          frame: freezeB64,
-          clicked_x: nx,
-          clicked_y: ny
-        })
-      });
-      if (r.ok) {
-        const d = await r.json();
-        segImg.src = "data:image/jpeg;base64," + d.frame;
+  
+  uploadButton.addEventListener("click", () => fileUploadInput.click());
+  fileUploadInput.addEventListener("change", evt => {
+    if (!evt.target.files.length) return;
+    const file = evt.target.files[0];
+    const rdr = new FileReader();
+    rdr.onload = () => {
+      uploadedImageData = rdr.result;
+      sideImage.src = uploadedImageData;
+      sideImage.style.display = "block";
+      uploadButton.style.display = "none";
+      if (segMode.value==="seg" && !segFrozen) {
+        segImg.src = uploadedImageData;
+        segImg.style.display = "block";
+        segVideo.style.display = "none";
       }
-      // In RealSense segmentation mode, stop the polling loop so the result remains frozen.
-      if (segMode.value === "realsense_seg") {
-        stopRealsenseSegLoop();
-      }
-    } catch (e) {
-      console.error("Seg error:", e);
-    } finally {
-      isSegmenting = false;
-    }
-  } else {
-    // Toggle segmentation off, i.e. resume the live stream.
+      if (depthMode.value==="image_depth") processImageDepth();
+    };
+    rdr.readAsDataURL(file);
+  });
+  
+  /****************************************************
+   * SEGMENTATION (Window2)
+   ****************************************************/
+  segMode.addEventListener("change", () => {
     segFrozen = false;
+    clearInterval(realsenseSegTimer);
     if (segMode.value === "seg") {
-      if (sideCamModeSelect.value === "camera" && localStream) {
-        segVideo.style.display = "block";
+      if (localStream && sideCamModeSelect.value==="camera") {
         segVideo.srcObject = localStream;
-        segImg.style.display   = "none";
+        segVideo.style.display = "block";
+        segImg.style.display = "none";
       } else {
         segVideo.style.display = "none";
-        segImg.style.display   = "block";
-        segImg.src = uploadedImageData || "https://via.placeholder.com/320x180?text=Seg";
+        segImg.style.display = "block";
+        segImg.src = uploadedImageData || segImg.src;
       }
-    } else if (segMode.value === "realsense_seg") {
-      // Resume the RealSense streaming loop.
-      startRealsenseSegLoop();
     }
-  }
-});
-
-function captureVideoFrame(videoEl) {
-  return new Promise((resolve, reject) => {
+    else if (segMode.value==="realsense_seg") {
+      segVideo.style.display = "none";
+      segImg.style.display = "block";
+      realsenseSegTimer = setInterval(fetchRealsenseSeg, 250);
+    }
+    else {
+      segVideo.style.display = "none";
+      segImg.style.display = "none";
+    }
+  });
+  
+  async function fetchRealsenseSeg() {
     try {
-      const c = document.createElement("canvas");
-      c.width  = videoEl.videoWidth;
-      c.height = videoEl.videoHeight;
-      c.getContext("2d").drawImage(videoEl, 0, 0);
-      const b64 = c.toDataURL("image/jpeg").split(",")[1];
-      resolve(b64);
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
+      const resp = await fetch("/process_realsense_seg",{ method:"POST" });
+      if (!resp.ok) throw "";
+      const d = await resp.json();
+      if (d.frame) segImg.src = "data:image/jpeg;base64,"+d.frame;
+    } catch {}
+  }
+  
+    segContainer.addEventListener("click", async ev => {
+    if (!["seg","realsense_seg"].includes(segMode.value) || isSegmenting) return;
 
-function captureSegFrame() {
-  return new Promise((resolve, reject) => {
-    if (segMode.value === "realsense_seg") {
-      if (!segImg.src) return reject("No RealSense seg frame available");
-      const parts = segImg.src.split(",");
-      if (parts.length > 1) {
-        resolve(parts[1]);
-      } else {
-        reject("Invalid segImg src");
-      }
-    } else if (segMode.value === "seg") {
-      if (sideCamModeSelect.value === "camera" && localStream) {
-        const c = document.createElement("canvas");
-        c.width  = segVideo.videoWidth;
-        c.height = segVideo.videoHeight;
-        c.getContext("2d").drawImage(segVideo, 0, 0);
-        const b64 = c.toDataURL("image/jpeg").split(",")[1];
-        resolve(b64);
-      } else {
-        if (!uploadedImageData) {
-          return reject("No uploaded image");
+    // ---------- FIRST CLICK  → freeze & segment ----------
+    if (!segFrozen) {
+      segFrozen    = true;
+      isSegmenting = true;
+      segVideo.style.display = "none";
+      segImg.style.display   = "block";
+
+      try {
+        const frameB64 = await captureSegFrame();
+        segImg.src     = "data:image/jpeg;base64," + frameB64;
+
+        const rect = segContainer.getBoundingClientRect();
+        const nx   = (ev.clientX - rect.left)  / rect.width;
+        const ny   = (ev.clientY - rect.top)   / rect.height;
+
+        const r = await fetch("/process_seg", {
+          method : "POST",
+          headers: { "Content-Type":"application/json" },
+          body   : JSON.stringify({ frame: frameB64, clicked_x: nx, clicked_y: ny })
+        });
+        if (r.ok){
+          const dd = await r.json();
+
+          // show geometry immediately
+          if (dd.object_info){
+            addChatMessage(
+              "AAU Agent",
+              `Center: ${dd.object_info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m; `
+            + `distance ${dd.object_info.distance_m.toFixed(3)} m; `
+            + `W×H ${(dd.object_info.width_m*100).toFixed(1)}×${(dd.object_info.height_m*100).toFixed(1)} cm`
+            );
+          }
+          segImg.src = "data:image/jpeg;base64," + dd.frame;
         }
-        const parts = uploadedImageData.split(",");
-        if (parts.length > 1) {
-          resolve(parts[1]);
+        if (segMode.value === "realsense_seg") clearInterval(realsenseSegTimer);
+      }
+      catch(e){ console.error("Seg error:", e); }
+      finally { isSegmenting = false; }
+    }
+
+    // ---------- SECOND CLICK → unfreeze & reset ----------
+    else {
+      segFrozen = false;
+      fetch("/reset_seg", { method:"POST" }).catch(()=>{});
+      if (segMode.value === "seg") {
+        if (localStream && sideCamModeSelect.value === "camera") {
+          segVideo.srcObject = localStream;
+          segVideo.style.display = "block";
+          segImg.style.display   = "none";
         } else {
-          reject("Invalid uploaded image data");
+          segVideo.style.display = "none";
+          segImg.style.display   = "block";
+          segImg.src = uploadedImageData || segImg.src;
         }
+      } else if (segMode.value === "realsense_seg") {
+        realsenseSegTimer = setInterval(fetchRealsenseSeg, 250);
       }
-    } else {
-      reject("Unsupported seg mode");
     }
   });
-}
 
-
-/****************************************************
- * 3) Depth (Window3)
- ****************************************************/
-const depthMode = document.getElementById("depthMode");
-const depthImg  = document.getElementById("depthImg");
-
-function updateDepthDropdown() {
-  // "camera" => show sidecam modes + local cam, realsense, etc.
-  // "image"  => show "image_depth"
-  // We'll always show realsense or local if realsenseAvailable or local cams exist
-  if (sideCamModeSelect.value === "camera") {
-    // Basic set
-    let opts = `
-      <option value="off">Off</option>
-      <option value="sidecam_depth">SideCam DepthAnything</option>
-      <option value="other">Other (Inverse)</option>
-    `;
-    // If realsense is available, add those
-    if (window.realsenseAvailable) {
-      opts += `
-        <option value="realsense_rgb_anything">RealSense RGB + DepthAnything</option>
-        <option value="realsense_depth">RealSense Depth</option>
+  /****************************************************
+   * DEPTH (Window3)
+   ****************************************************/
+  function updateDepthDropdown(){
+    if (sideCamModeSelect.value==="camera"){
+      let opts = `
+        <option value="off">Off</option>
+        <option value="sidecam_depth">SideCam DepthAnything</option>
+        <option value="other">Other (Inverse)</option>
+      `;
+      if (window.realsenseAvailable){
+        opts+=`
+          <option value="realsense_rgb_anything">RealSense RGB+DepthAnything</option>
+          <option value="realsense_depth">RealSense Depth</option>
+        `;
+      }
+      depthMode.innerHTML = opts;
+    } else {
+      depthMode.innerHTML = `
+        <option value="off">Off</option>
+        <option value="image_depth">Image Depth Anything</option>
       `;
     }
-    depthMode.innerHTML = opts;
-  } else {
-    // "image" => just off or "image_depth"
-    depthMode.innerHTML = `
-      <option value="off">Off</option>
-      <option value="image_depth">Image Depth Anything</option>
-    `;
   }
-}
-
-depthMode.addEventListener("change", () => {
-  stopDepthLoop();
-  depthImg.src = "https://via.placeholder.com/320x180?text=Depth";
-  const v = depthMode.value;
-  if (v === "off") {
-    fetch("/process_depth", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ camera_mode:"off" })
-    });
-  } else if (sideCamModeSelect.value === "camera") {
-    // If we picked something besides "off" in camera mode => do a loop
-    // "sidecam_depth", "local_depth_anything", "realsense_rgb_anything", "realsense_depth", "other"
-    startDepthLoop(v);
-  } else {
-    // "image_depth" => single call
-    processImageDepth();
-  }
-});
-
-function startDepthLoop(cameraMode) {
-  stopDepthLoop();
-  depthInterval = setInterval(async () => {
-    try {
-      let b64 = "";
-      // For "sidecam_depth" or "other", we want to pass the current sideVideo frame
-      // For local_depth_anything, the server handles local camera itself, so we might not need a frame
-      // but let's see your code. We'll just pass the sideVideo frame for "sidecam_depth" or "other"
-      if (cameraMode === "sidecam_depth" || cameraMode === "other" || cameraMode === "default_anything") {
-        b64 = await captureSideFrame(); // from sideVideo
-      }
-      // local_depth_anything or realsense => the server grabs frames from local camera or realsense
-      // but some code might expect a frame anyway. We'll pass an empty string if we don't want to
-      // or always pass it if the server doesn't mind. For safety, let's do the same for "other".
-      // This depends on your server. We'll keep it simple.
-      const resp = await fetch("/process_depth", {
-        method: "POST",
-        headers: { "Content-Type":"application/json" },
-        body: JSON.stringify({
-          camera_mode: cameraMode,
-          local_idx: 0,
-          frame: b64
-        })
-      });
-      if (!resp.ok) throw new Error("Depth error: " + resp.status);
-      const data = await resp.json();
-      if (data.frame) {
-        depthImg.src = "data:image/jpeg;base64," + data.frame;
-      }
-    } catch(e) {
-      console.error("Depth loop error:", e);
+  
+  depthMode.addEventListener("change", () => {
+    clearInterval(depthTimer);
+    depthImg.src="https://via.placeholder.com/320x180?text=Depth";
+    const v=depthMode.value;
+    if (v==="off"){
+      fetch("/process_depth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_mode:"off"})});
     }
-  }, 500);
-}
-
-function stopDepthLoop() {
-  if (depthInterval) {
-    clearInterval(depthInterval);
-    depthInterval = null;
-  }
-}
-
-// If "image_depth", we do a single call whenever user changes
-async function processImageDepth() {
-  try {
-    const b64 = await captureSideFrame();
-    const resp = await fetch("/process_depth", {
-      method: "POST",
-      headers: { "Content-Type":"application/json" },
-      body: JSON.stringify({
-        camera_mode: "image_depth",
-        local_idx: 0,
-        frame: b64
-      })
-    });
-    if (!resp.ok) throw new Error("Depth error: " + resp.status);
-    const data = await resp.json();
-    if (data.frame) {
-      depthImg.src = "data:image/jpeg;base64," + data.frame;
+    else if (sideCamModeSelect.value==="camera"){
+      depthTimer=setInterval(() => processDepth(v),500);
     }
-  } catch(e){
-    console.error("Image depth error:", e);
-  }
-}
-
-/** captureSideFrame => base64 from sideVideo or from uploadedImageData if in "image" mode. */
-function captureSideFrame() {
-  return new Promise((resolve, reject) => {
-    if (sideCamModeSelect.value === "camera") {
-      if (!sideVideo.srcObject) return reject("No sidecam feed");
-      try {
-        const c = document.createElement("canvas");
-        c.width = sideVideo.videoWidth;
-        c.height= sideVideo.videoHeight;
-        c.getContext("2d").drawImage(sideVideo, 0, 0, c.width, c.height);
-        const b64 = c.toDataURL("image/jpeg").split(",")[1];
-        resolve(b64);
-      } catch(e){
-        reject(e);
-      }
-    } else {
-      // "image"
-      if (!uploadedImageData) {
-        return reject("No uploaded image");
-      }
-      const parts = uploadedImageData.split(",");
-      if (parts.length > 1) {
-        resolve(parts[1]); // the base64 part
-      } else {
-        // not standard dataURL?
-        reject("Invalid dataURL in uploadedImageData");
-      }
+    else{
+      processImageDepth();
     }
   });
-}
-
-/****************************************************
- * 4) Chat (Window4)
- ****************************************************/
-const chatMessages = document.getElementById("chatMessages");
-const chatInput    = document.getElementById("chatInput");
-const chatSendBtn  = document.getElementById("chatSendBtn");
-
-chatSendBtn.addEventListener("click", () => sendChat());
-chatInput.addEventListener("keyup", (e) => { 
-  if (e.key === "Enter") sendChat();
-});
-
-function addChatMessage(sender, msg) {
-  if (chatMessages.children.length >= 1000) {
-    chatMessages.removeChild(chatMessages.firstChild);
+  
+  async function processDepth(mode){
+    try {
+      let b64="";
+      if (mode==="sidecam_depth"||mode==="other"){
+        b64 = await captureSideFrame();
+      }
+      const r = await fetch("/process_depth",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ camera_mode:mode, local_idx:0, frame:b64 })
+      });
+      const d = await r.json();
+      if (d.frame) depthImg.src="data:image/jpeg;base64,"+d.frame;
+    } catch(e){ console.error(e) }
   }
-  const dv = document.createElement("div");
-  dv.innerHTML = `<strong>${sender}:</strong> ${msg}`;
-  chatMessages.appendChild(dv);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-}
+  
+  async function processImageDepth(){
+    try {
+      const b64 = await captureSideFrame();
+      const r = await fetch("/process_depth",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ camera_mode:"image_depth", local_idx:0, frame:b64 })
+      });
+      const d = await r.json();
+      if (d.frame) depthImg.src="data:image/jpeg;base64,"+d.frame;
+    } catch(e){ console.error(e) }
+  }
+  
+  /****************************************************
+   * FRAME CAPTURE UTILS
+   ****************************************************/
+  function captureSideFrame(){
+    return new Promise((res,rej)=>{
+      if (sideCamModeSelect.value==="camera" && localStream){
+        const c=document.createElement("canvas");
+        c.width=sideVideo.videoWidth; c.height=sideVideo.videoHeight;
+        c.getContext("2d").drawImage(sideVideo,0,0);
+        res(c.toDataURL("image/jpeg").split(",")[1]);
+      } else if (uploadedImageData){
+        const p=uploadedImageData.split(",");
+        p[1]? res(p[1]) : rej("Bad dataURL");
+      } else rej("No frame");
+    });
+  }
+  function captureSegFrame(){
+    return new Promise((res,rej)=>{
+      if (segMode.value==="realsense_seg"){
+        const p=segImg.src.split(",");
+        p[1]? res(p[1]) : rej("No RealSense frame");
+      }
+      else if (segMode.value==="seg"){
+        if (sideCamModeSelect.value==="camera"&&localStream){
+          const c=document.createElement("canvas");
+          c.width=segVideo.videoWidth; c.height=segVideo.videoHeight;
+          c.getContext("2d").drawImage(segVideo,0,0);
+          res(c.toDataURL("image/jpeg").split(",")[1]);
+        } else {
+          const p=uploadedImageData.split(",");
+          p[1]? res(p[1]) : rej("No uploaded image");
+        }
+      } else rej("Unsupported mode");
+    });
+  }
+  
+  /****************************************************
+   * CHAT (Window4)
+   ****************************************************/
+  function addChatMessage(sender,msg){
+    if (chatMessages.children.length>1000) chatMessages.removeChild(chatMessages.firstChild);
+    const dv=document.createElement("div");
+    dv.innerHTML=`<strong>${sender}:</strong> ${msg}`;
+    chatMessages.appendChild(dv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+  
+/****************************************************
+ * CHAT (Window4)  — send a line to the back-end
+ ****************************************************/
+ async function sendChat(customText){
+  const txt       = (customText || chatInput.value).trim();
+  if (!txt) return;
 
-async function sendChat(customText) {
-  const userText = customText || chatInput.value.trim();
-  if (!userText) return;
   chatInput.value = "";
-  addChatMessage("You", userText);
+  addChatMessage("You", txt);
 
+  //-------------------------------------------------
+  // Freeze the current Seg frame (if not already)
+  //-------------------------------------------------
+  let frameB64 = "";
   try {
-    // Capture the current seg window frame.
-    let segFrame = await captureSegFrame().catch(err => null);
-    const segInput = document.getElementById("segMode").value;
-    
+    frameB64   = await captureSegFrame();
+    segFrozen  = true;
+    clearInterval(realsenseSegTimer);
+    segVideo.srcObject    = null;
+    segImg.src            = "data:image/jpeg;base64," + frameB64;
+    segImg.style.display  = "block";
+    segVideo.style.display= "none";
+  } catch {}
+
+  //-------------------------------------------------
+  // Tell the user what we’re about to do
+  //-------------------------------------------------
+  const txtLower = txt.toLowerCase();
+  if (txtLower === "yes" || txtLower === "y"){
+    addChatMessage("AAU Agent", "Confirming your selection…");
+  } else {
+    addChatMessage(
+      "AAU Agent",
+      "Sending request to AI server, this may take a few seconds…"
+    );
+  }
+
+  //-------------------------------------------------
+  // Call the Flask back-end
+  //-------------------------------------------------
+  let d = null;
+  try {
     const resp = await fetch("/chat", {
-      method:"POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ 
-        text: userText,
-        seg_input: segInput,
-        seg_frame: segFrame
+      method : "POST",
+      headers: { "Content-Type":"application/json" },
+      body   : JSON.stringify({
+        text      : txt,
+        seg_input : segMode.value,
+        seg_frame : frameB64
       })
     });
-    if (!resp.ok) throw new Error("Chat request failed: " + resp.status);
-    const d = await resp.json();
-    addChatMessage("AAU Agent", d.reply);
-    
-    // Update the SEG window with the candidate overlay image (freeze it).
-    if (d.seg_frame) {
-      const segImg = document.getElementById("segImg");
-      segImg.src = "data:image/jpeg;base64," + d.seg_frame;
-      segImg.style.display = "block";
-      const segVideo = document.getElementById("segVideo");
-      if (segVideo) segVideo.style.display = "none";
+
+    if (!resp.ok){
+      // server returned 4xx/5xx → show first 120 chars of plain text
+      const errText = (await resp.text()).slice(0,120);
+      addChatMessage("AAU Agent", `Server error (${resp.status}): ${errText}`);
+      return;
     }
-  } catch(err) {
-    console.error(err);
-    addChatMessage("AAU Agent", "Error: " + err.toString());
+    d = await resp.json();
+  }
+  catch(e){
+    console.error(e);
+    addChatMessage("AAU Agent", "Error: " + e);
+    return;
+  }
+
+  //-------------------------------------------------
+  // Show overlay frame (candidate OR final segment)
+  //-------------------------------------------------
+  const ov = d.overlay_frame || d.seg_frame;
+  if (ov){
+    segImg.src = "";
+    setTimeout(()=> segImg.src = "data:image/jpeg;base64," + ov, 10);
+  }
+
+  //-------------------------------------------------
+  // Show geometry if present
+  //-------------------------------------------------
+  if (d.object_info){
+    addChatMessage(
+      "AAU Agent",
+      `Center: ${d.object_info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m, `
+    + `distance ${d.object_info.distance_m.toFixed(3)} m, `
+    + `W×H ${(d.object_info.width_m*100).toFixed(1)}×${(d.object_info.height_m*100).toFixed(1)} cm`
+    );
+  }
+
+  //-------------------------------------------------
+  // Always show the first line of the textual reply
+  //-------------------------------------------------
+  addChatMessage("AAU Agent", d.reply.split("\n")[0]);
+
+  //-------------------------------------------------
+  // If we’re still in confirm stage, prompt the user
+  //-------------------------------------------------
+  if (d.overlay_frame && !d.seg_frame){
+    setTimeout(()=> addChatMessage(
+      "AAU Agent",
+      "Selecting best candidate point (in blue). Please type “yes” if the point is on the correct object."
+    ), 800);
   }
 }
 
-
-/****************************************************
- * 5) LLM Reasoning (Window7)
- ****************************************************/
-const llmConsole = document.getElementById("llmConsole");
-function logToConsole(msg){
-  if (llmConsole.children.length >= 1000){
-    llmConsole.removeChild(llmConsole.firstChild);
+  chatSendBtn.addEventListener("click",()=>sendChat());
+  chatInput.addEventListener("keyup",e=>{ if(e.key==="Enter") sendChat(); });
+  
+  /****************************************************
+   * LLM Console
+   ****************************************************/
+  function logToConsole(msg){
+    if (llmConsole.children.length>1000) llmConsole.removeChild(llmConsole.firstChild);
+    const dv=document.createElement("div");
+    dv.textContent=msg;
+    llmConsole.appendChild(dv);
+    llmConsole.scrollTop=llmConsole.scrollHeight;
   }
-  const dv = document.createElement("div");
-  dv.textContent = msg;
-  llmConsole.appendChild(dv);
-  llmConsole.scrollTop = llmConsole.scrollHeight;
-}
-</script>
-</body>
-</html>
+  </script>
+  
