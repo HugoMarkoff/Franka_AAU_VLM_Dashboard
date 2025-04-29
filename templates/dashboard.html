@@ -346,68 +346,86 @@
     } catch {}
   }
   
-    segContainer.addEventListener("click", async ev => {
-    if (!["seg","realsense_seg"].includes(segMode.value) || isSegmenting) return;
+// Freeze the Seg window — no more frames will arrive until we unfreeze
+function freezeSegWindow(base64Frame) {
+  segFrozen    = true;
+  isSegmenting = true;
+  clearInterval(realsenseSegTimer);
 
-    // ---------- FIRST CLICK  → freeze & segment ----------
-    if (!segFrozen) {
-      segFrozen    = true;
-      isSegmenting = true;
-      segVideo.style.display = "none";
-      segImg.style.display   = "block";
+  // disable camera track & pause
+  if (segMode.value === "seg" && localStream) {
+    localStream.getVideoTracks().forEach(t => t.enabled = false);
+    segVideo.pause();
+  }
 
-      try {
-        const frameB64 = await captureSegFrame();
-        segImg.src     = "data:image/jpeg;base64," + frameB64;
+  // swap to your frozen JPEG
+  segImg.src            = "data:image/jpeg;base64," + base64Frame;
+  segVideo.style.display = "none";
+  segImg.style.display   = "block";
+}
 
-        const rect = segContainer.getBoundingClientRect();
-        const nx   = (ev.clientX - rect.left)  / rect.width;
-        const ny   = (ev.clientY - rect.top)   / rect.height;
+// Unfreeze & resume your live feed
+function unfreezeSegWindow() {
+  segFrozen = false;
+  fetch("/reset_seg", { method:"POST" }).catch();
 
-        const r = await fetch("/process_seg", {
-          method : "POST",
-          headers: { "Content-Type":"application/json" },
-          body   : JSON.stringify({ frame: frameB64, clicked_x: nx, clicked_y: ny })
-        });
-        if (r.ok){
-          const dd = await r.json();
+  if (segMode.value === "seg" && localStream) {
+    // re-enable track and replay
+    localStream.getVideoTracks().forEach(t => t.enabled = true);
+    segVideo.srcObject = localStream;
+    segVideo.play();
+    segVideo.style.display = "block";
+    segImg.style.display   = "none";
+  }
+  else if (segMode.value === "realsense_seg") {
+    realsenseSegTimer = setInterval(fetchRealsenseSeg, 250);
+  }
+}
 
-          // show geometry immediately
-          if (dd.object_info){
-            addChatMessage(
-              "AAU Agent",
-              `Center: ${dd.object_info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m; `
-            + `distance ${dd.object_info.distance_m.toFixed(3)} m; `
-            + `W×H ${(dd.object_info.width_m*100).toFixed(1)}×${(dd.object_info.height_m*100).toFixed(1)} cm`
-            );
-          }
-          segImg.src = "data:image/jpeg;base64," + dd.frame;
+
+segContainer.addEventListener("click", async ev => {
+  if (!["seg","realsense_seg"].includes(segMode.value) || isSegmenting) return;
+
+  // — FIRST CLICK: freeze and segment —
+  if (!segFrozen) {
+    try {
+      const frameB64 = await captureSegFrame();
+      freezeSegWindow(frameB64);
+
+      // translate click → normalized image coords
+      const rr = segImg.getBoundingClientRect();
+      const nx = (ev.clientX - rr.left) / rr.width;
+      const ny = (ev.clientY - rr.top)  / rr.height;
+
+      const resp = await fetch("/process_seg", {
+        method:  "POST",
+        headers: { "Content-Type":"application/json" },
+        body:    JSON.stringify({ frame: frameB64, clicked_x: nx, clicked_y: ny })
+      });
+      if (resp.ok) {
+        const dd = await resp.json();
+        if (dd.object_info) {
+          addChatMessage(
+            "AAU Agent",
+            `Center: ${dd.object_info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m; ` +
+            `distance ${dd.object_info.distance_m.toFixed(3)} m; ` +
+            `W×H ${(dd.object_info.width_m*100).toFixed(1)}×${(dd.object_info.height_m*100).toFixed(1)} cm`
+          );
         }
-        if (segMode.value === "realsense_seg") clearInterval(realsenseSegTimer);
+        // update overlay on your frozen image
+        segImg.src = "data:image/jpeg;base64," + dd.frame;
       }
-      catch(e){ console.error("Seg error:", e); }
-      finally { isSegmenting = false; }
+    } catch(e) {
+      console.error("Seg error:", e);
+    } finally {
+      isSegmenting = false;
     }
-
-    // ---------- SECOND CLICK → unfreeze & reset ----------
-    else {
-      segFrozen = false;
-      fetch("/reset_seg", { method:"POST" }).catch(()=>{});
-      if (segMode.value === "seg") {
-        if (localStream && sideCamModeSelect.value === "camera") {
-          segVideo.srcObject = localStream;
-          segVideo.style.display = "block";
-          segImg.style.display   = "none";
-        } else {
-          segVideo.style.display = "none";
-          segImg.style.display   = "block";
-          segImg.src = uploadedImageData || segImg.src;
-        }
-      } else if (segMode.value === "realsense_seg") {
-        realsenseSegTimer = setInterval(fetchRealsenseSeg, 250);
-      }
-    }
-  });
+  }
+  // — SECOND CLICK: unfreeze —
+  else {
+    unfreezeSegWindow();
+  }
+});
 
   /****************************************************
    * DEPTH (Window3)
@@ -543,7 +561,10 @@
     frameB64   = await captureSegFrame();
     segFrozen  = true;
     clearInterval(realsenseSegTimer);
-    segVideo.srcObject    = null;
+    if (segMode.value === "seg" && localStream) {
+      segVideo.pause();
+      segVideo.srcObject = null;
+    }
     segImg.src            = "data:image/jpeg;base64," + frameB64;
     segImg.style.display  = "block";
     segVideo.style.display= "none";
@@ -595,10 +616,11 @@
   // Show overlay frame (candidate OR final segment)
   //-------------------------------------------------
   const ov = d.overlay_frame || d.seg_frame;
-  if (ov){
-    segImg.src = "";
-    setTimeout(()=> segImg.src = "data:image/jpeg;base64," + ov, 10);
+  if (ov) {
+    // Just update directly—no blanking + timeout
+    segImg.src = "data:image/jpeg;base64," + ov;
   }
+
 
   //-------------------------------------------------
   // Show geometry if present

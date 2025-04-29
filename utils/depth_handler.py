@@ -168,82 +168,103 @@ class DepthHandler:
         ok, frame = self.local_cap.read()
         return frame if ok else None
 
-    # ------------------------------------------------------------------
-    # Depth-Anything utility
-    # ------------------------------------------------------------------
-    def run_depth_anything(self, pil_img: Image.Image) -> Image.Image:
-        depth_out   = self.depth_anything(pil_img)
-        depth_arr   = np.array(depth_out["depth"], dtype=np.float32)
-        depth_norm  = cv2.normalize(depth_arr, None, 0, 255, cv2.NORM_MINMAX).astype(
-            np.uint8
-        )
-        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-        return Image.fromarray(depth_color[..., ::-1])
-
-    # ------------------------------------------------------------------
-    # NEW  — calculate_object_info
-    # ------------------------------------------------------------------
-    # depth_handler.py  ── replace the whole calculate_object_info() body
     def calculate_object_info(self, mask_bool: np.ndarray, depth_arr: np.ndarray):
-        if mask_bool is None or depth_arr is None:
+        import numpy as np, cv2, pyrealsense2 as rs
+
+        # 1) Align mask to depth resolution
+        h_m, w_m = mask_bool.shape
+        h_d, w_d = depth_arr.shape
+        if (h_m, w_m) != (h_d, w_d):
+            mask_depth = cv2.resize(
+                mask_bool.astype(np.uint8),
+                (w_d, h_d),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+        else:
+            mask_depth = mask_bool
+
+        # 2) Compute centroid in mask space
+        ys, xs = np.where(mask_depth)
+        if ys.size == 0:
+            print("[DepthHandler] No mask pixels found.")
             return None
-        if mask_bool.shape != depth_arr.shape:
-            print("[DepthHandler] mask/depth shape mismatch")
+        cy_init, cx_init = int(ys.mean() + 0.5), int(xs.mean() + 0.5)
+
+        # 3) Dynamic patch expansion until >=3 valid depths
+        max_patch = 25  # up to 25x25
+        patch_size = 5
+        patch = None
+        nonzero = 0
+        while patch_size <= max_patch:
+            radius = patch_size // 2
+            y0 = max(cy_init - radius, 0)
+            y1 = min(cy_init + radius, h_d - 1)
+            x0 = max(cx_init - radius, 0)
+            x1 = min(cx_init + radius, w_d - 1)
+            patch = depth_arr[y0:y1+1, x0:x1+1].astype(np.float32)
+            flat = patch.flatten()
+            nonzero = np.count_nonzero(flat)
+            print(f"[DepthHandler] {patch_size}x{patch_size} patch depths (mm): {flat.tolist()}")
+            if nonzero >= 3:
+                break
+            patch_size += 2
+        if patch is None or nonzero == 0:
+            print(f"[DepthHandler] No non-zero depths found up to {max_patch}x{max_patch} patch.")
             return None
 
-        # ————————————————————————————
-        # 1) get pixel centroid of mask
-        # ————————————————————————————
-        rows, cols = np.where(mask_bool)
-        if len(rows) == 0:
-            return None
-        cy = int(rows.mean() + 0.5)
-        cx = int(cols.mean() + 0.5)
+        # 4) Filter non-zero values and cluster by tolerance
+        vals = flat[flat > 0]
+        vals_m = vals / 1000.0
+        med = np.median(vals_m)
+        rel_tol = 0.10 * med
+        abs_tol = 0.02
+        tol = max(rel_tol, abs_tol)
+        good = vals_m[np.abs(vals_m - med) <= tol]
+        if good.size < (vals_m.size / 2):
+            good = vals_m
+        z_m = float(np.mean(good))
 
-        # ————————————————————————————
-        # 2) take 5×5 depth patch, filter
-        # ————————————————————————————
-        patch = depth_arr[max(cy-2,0):cy+3, max(cx-2,0):cx+3].astype(np.float32)
-        patch = patch[patch > 0]                # drop invalid values (0 mm)
+        # 5) Build front-face mask and bounding-box based on tolerance around median
+        depth_m = depth_arr.astype(np.float32) / 1000.0
+        front = mask_depth & (np.abs(depth_m - med) <= tol)
+        if front.sum() < (mask_depth.sum() * 0.1):
+            front = mask_depth
+        ys_f, xs_f = np.where(front)
+        x_min, x_max = xs_f.min(), xs_f.max()
+        y_min, y_max = ys_f.min(), ys_f.max()
+        px_w = x_max - x_min + 1
+        px_h = y_max - y_min + 1
 
-        if patch.size == 0:
-            return None
-        med   = np.median(patch)
-        good  = patch[np.abs(patch - med) < 0.15*med]   # ±15 % around median
-        if good.size == 0:
-            good = patch
-        z_m   = good.mean() / 1000.0            # mm → m
-
-        # ————————————————————————————
-        # 3) width & height from pixels
-        #    using pin-hole equation L = p·Z / f
-        # ————————————————————————————
-        x_min, x_max = cols.min(), cols.max()
-        y_min, y_max = rows.min(), rows.max()
-        px_w   = x_max - x_min + 1
-        px_h   = y_max - y_min + 1
-
+        # 6) Compute physical size via pinhole model
         if not self.rs_active:
             print("[DepthHandler] RealSense not active")
             return None
-        intr = self.rs_pipeline.get_active_profile() \
-                            .get_stream(rs.stream.depth) \
-                            .as_video_stream_profile() \
-                            .get_intrinsics()
-
-        width_m  = (px_w * z_m) / intr.fx
+        intr = (
+            self.rs_pipeline
+                .get_active_profile()
+                .get_stream(rs.stream.depth)
+                .as_video_stream_profile()
+                .get_intrinsics()
+        )
+        width_m = (px_w * z_m) / intr.fx
         height_m = (px_h * z_m) / intr.fy
 
-        # ————————————————————————————
-        # 4) de-project centroid for XYZ
-        # ————————————————————————————
+        # 7) Apply fixed scale factor for calibration (e.g., 0.62)
+        fixed_scale = 0.62
+        width_m *= fixed_scale
+        height_m *= fixed_scale
+        print(f"[DepthHandler] Applied fixed scale factor: {fixed_scale}")
+
+        # 8) Deproject centroid to 3D XYZ and compute distance
         center_xyz = rs.rs2_deproject_pixel_to_point(
-            intr, [float(cx), float(cy)], z_m)
+            intr, [float(cx_init), float(cy_init)], z_m
+        )
+        distance_m = float(np.linalg.norm(center_xyz))
 
         return {
             "center_xyz_m": center_xyz,
-            "distance_m"  : float(np.linalg.norm(center_xyz)),
-            "width_m"     : float(width_m),
-            "height_m"    : float(height_m),
-            "bbox_px"     : [int(x_min), int(y_min), int(x_max), int(y_max)],
+            "distance_m": distance_m,
+            "width_m": float(width_m),
+            "height_m": float(height_m),
+            "bbox_px": [int(x_min), int(y_min), int(x_max), int(y_max)]
         }
