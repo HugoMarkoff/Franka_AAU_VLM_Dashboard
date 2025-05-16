@@ -11,7 +11,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 import requests
-
+import flask
+from flask import Response, stream_with_context, request
+import httpx, asyncio
 from utils.sam_handler import SamHandler
 from utils.depth_handler import DepthHandler, RS_OK
 from utils.robopoints_handler import RoboPointsHandler
@@ -19,7 +21,18 @@ from utils.robopoints_handler import RoboPointsHandler
 app = Flask(__name__)
 CORS(app)
 
-REMOTE_POINTS_ENDPOINT = "https://23f4-130-225-198-197.ngrok-free.app/predict"
+# in settings.py or top of app.py
+NGROK_BASE = "https://9733-130-225-198-197.ngrok-free.app"
+
+REMOTE_POINTS_ENDPOINT = f"{NGROK_BASE}/predict"      # RoboPoint
+LLM_STREAM             = f"{NGROK_BASE}/chat-stream"  # token stream
+LLM_FULL               = f"{NGROK_BASE}/chat"         # full reply
+
+# top-of-file imports
+from utils.llm_handler import LLMHandler
+
+llm = LLMHandler(stream_url=LLM_STREAM, full_url=LLM_FULL)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Using device: {device}")
 
@@ -43,6 +56,133 @@ g_frozen_seg = None  # This will store the frozen candidate overlay image (PIL I
 executor = ThreadPoolExecutor(max_workers=2)
 seg_lock = threading.Lock()
 depth_lock = threading.Lock()
+
+POINT_RE = re.compile(r"\(([0-9.+-eE]+)\s*,\s*([0-9.+-eE]+)\)")
+
+def _points_from_string(raw: str):
+    """
+    Turn RoboPoint's 'result' string into a list of (x,y) floats in [0,1].
+
+    Accepts:
+        '[(0.37, 0.61)]'
+        '(0.37,0.61)'
+        '0.37,0.61'
+        'x=0.37 y=0.61'
+        '[(0.37,0.61), (0.12,0.88)]'
+    Returns [] if **no** valid pair is found.
+    """
+    raw = raw.strip()
+    # 1) quick normalisation of the simplest '0.37,0.61' case
+    if raw.count(',') == 1 and raw.count('(') == 0:
+        try:
+            x, y = map(float, raw.split(','))
+            return [(x, y)]
+        except Exception:
+            pass
+    # 2) general regex search – tolerant of any wrapper text
+    matches = POINT_RE.findall(raw)
+    return [tuple(map(float, xy)) for xy in matches]
+
+
+# ────────────────────────────────────────────────────────────────────
+#  /exec_action  – returns placement + full geometry string
+# ────────────────────────────────────────────────────────────────────
+@app.route("/exec_action", methods=["POST"])
+def exec_action():
+    """
+    POST  {
+      "action_block": "<full [ACTION] text>",
+      "seg_frame"   : "<base64 RGB frame>"
+    }
+
+    Success 200  {
+      "seg_frame"   : "<JPEG with mask>",
+      "found_msg"   : "…",                # human-readable summary
+      "geometry_msg": "Center: …",        # always present (or "(No geometry…)")
+      "placement"   : "centre-left",      # coarse location in the frame
+      "object_info" : {…}|null,           # raw numbers (may be null)
+      "rp_result"   : "[(…)]"             # RoboPoint raw string
+    }
+    """
+    global g_last_raw_frame
+
+    data        = request.json or {}
+    block_txt   = data.get("action_block", "")
+    frame_b64   = data.get("seg_frame", "")
+
+    # 0) Decode frozen frame ---------------------------------------------------
+    try:
+        g_last_raw_frame = base64.b64decode(frame_b64)
+    except Exception as e:
+        return jsonify({"error": f"Invalid seg_frame: {e}"}), 400
+    pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
+
+    # 1) Build RoboPoint instruction ------------------------------------------
+    m = re.search(r"RoboPoint\s*Request:\s*([^;\n|]+)", block_txt, flags=re.I)
+    if not m:
+        return jsonify({"error": "Malformed [ACTION] block"}), 400
+    obj_phrase  = m.group(1).strip()
+    instruction = re.sub(r"^\s*the\s+", "", obj_phrase, flags=re.I)
+
+    # 2) Call RoboPoint --------------------------------------------------------
+    rp_result = robo_handler.call_remote_for_points(frame_b64, instruction)
+    print(f"[RoboPoint result] {rp_result}")
+    pts = _points_from_string(rp_result)
+
+    if not pts:
+        err = f"RoboPoint returned no usable coordinates for “{instruction}”."
+        return jsonify({"error": err, "rp_result": rp_result}), 502
+
+    # Use the first candidate point
+    x0, y0 = pts[0]
+
+    # 3) Quick coarse placement -----------------------------------------------
+    def coarse_placement(nx: float, ny: float) -> str:
+        col = "left" if nx < 0.33 else "right" if nx > 0.66 else "centre"
+        row = "top"  if ny < 0.33 else "bottom" if ny > 0.66 else "middle"
+        return f"{row}-{col}" if (row != "middle" or col != "centre") else "centre"
+
+    placement = coarse_placement(x0, y0)
+
+    # 4) SAM overlay -----------------------------------------------------------
+    seg_img = sam_handler.run_sam_overlay(pil_img, pts, active_idx=0)
+    seg_img = draw_points_on_image(seg_img, str(pts), active_idx=0, only_active=True)
+    seg_b64 = pil_to_b64(seg_img)
+
+    # 5) Depth geometry --------------------------------------------------------
+    object_info = None
+    if depth_handler.start_realsense():
+        _, depth_arr = depth_handler.get_realsense_frames()
+        mask_bool    = sam_handler.get_last_mask()
+        object_info  = depth_handler.calculate_object_info(mask_bool, depth_arr)
+
+    if object_info:
+        cx, cy, cz   = object_info["center_xyz_m"]
+        geometry_msg = (
+            f"Center: {cx:.3f}, {cy:.3f}, {cz:.3f} m; "
+            f"distance {object_info['distance_m']:.3f} m; "
+            f"W×H {object_info['width_m']*100:.1f}×"
+            f"{object_info['height_m']*100:.1f} cm"
+        )
+    else:
+        geometry_msg = "(No geometry available)"
+
+    # 6) Human-readable found message -----------------------------------------
+    found_msg = (
+        f"{instruction} located at {placement} "
+        f"({x0:.2f}, {y0:.2f}); {geometry_msg}"
+    )
+
+    # 7) Respond ---------------------------------------------------------------
+    return jsonify({
+        "seg_frame"   : seg_b64,
+        "found_msg"   : found_msg,     # richer text for chat UI
+        "geometry_msg": geometry_msg,  # fine-grained numbers
+        "placement"   : placement,
+        "object_info" : object_info,
+        "rp_result"   : rp_result
+    })
+
 
 ###########################
 # Helper Functions
@@ -189,92 +329,155 @@ def camera_info():
         "realsense_devices": rs_devices
     })
 
+def broadcast_to_llm_console(token):
+    # TEMP: Just print. You should route to a WebSocket or SSE for true real-time in the browser.
+    print(f"[LLM Reasoning] {token}")
+
+
+# ---------------------------------------------------------------------------
+#  STREAMING CHAT ENDPOINT  (drop-in replacement)
+# ---------------------------------------------------------------------------
+@app.route("/chat-stream", methods=["POST"])
+def chat_stream():
+    """
+    Streams two kinds of Server-Sent Events (SSE):
+
+        event: reasoning   data: <incremental text inside <think>...</think>>
+        event: answer      data: <final answer (after </think>)>
+
+    Nothing else is ever sent – no “[DONE]”.
+    """
+    import httpx, asyncio
+    text = (request.json or {}).get("text", "").strip()
+
+    async def relay():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                llm.stream_url,                # remote FastAPI streaming endpoint
+                json={"prompt": text},
+            ) as r:
+
+                in_think     = False           # True ⇢ we are inside <think>...</think>
+                answer_parts = []              # collect answer after </think>
+
+                async for raw in r.aiter_lines():
+                    if not raw or not raw.startswith("data:"):
+                        continue
+
+                    tok = raw[5:].lstrip()
+
+                    # --- handle open/close tags ---------------------------------
+                    while tok:
+                        if not in_think:
+                            # look for <think>
+                            start = tok.find("<think>")
+                            if start == -1:
+                                # no reasoning begins here – treat as answer text
+                                answer_parts.append(tok)
+                                tok = ""
+                            else:
+                                # jump past "<think>"
+                                tok   = tok[start + 7 :]
+                                in_think = True
+                        else:
+                            # we are inside reasoning – look for </think>
+                            end = tok.find("</think>")
+                            if end == -1:
+                                # no end yet → whole chunk is reasoning
+                                yield f"event: reasoning\ndata: {tok}\n\n"
+                                tok = ""
+                            else:
+                                # stream up to end, then switch to answer mode
+                                reasoning_chunk = tok[:end]
+                                if reasoning_chunk:
+                                    yield f"event: reasoning\ndata: {reasoning_chunk}\n\n"
+                                tok       = tok[end + 8 :]  # jump past "</think>"
+                                in_think  = False
+                    # ----------------------------------------------------------------
+
+                # after upstream closes: flush whatever answer we buffered
+                final_answer = "".join(answer_parts).strip()
+                if final_answer:
+                    yield f"event: answer\ndata: {final_answer}\n\n"
+
+    # ---------- bridge async generator → Flask streaming Response ---------------
+    def event_stream():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        agen = relay().__aiter__()
+        try:
+            while True:
+                chunk = loop.run_until_complete(agen.__anext__())
+                yield chunk
+        except StopAsyncIteration:
+            pass
+
+    return Response(stream_with_context(event_stream()),
+                    mimetype="text/event-stream")
+
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    Stage 1 (“rgb” mode)   : talk to remote AI to get candidate points.
-    Stage 2 (“confirm” mode): user types ‘yes’ or something else.
-                              If ‘yes’ we FINALISE and also return object_info.
-    """
-    data  = request.json or {}
-    text  = data.get("text", "").strip().lower()
-    global g_last_raw_frame
+    data = request.json or {}
+    text = data.get("text", "").strip()
+    frame_b64 = data.get("seg_frame", "")
 
-    # ------------------------------------------------------------------
-    #  STAGE 1  Get candidate points from remote AI
-    # ------------------------------------------------------------------
-    if g_state["mode"] == "rgb":
-        seg_input  = data.get("seg_input", "on")
-        seg_frame  = data.get("seg_frame", None)
-        candidate  = get__current_frame(seg_input, seg_frame, text)   # calls remote AI
+    # Step 1: Call LLM handler
+    thinking_tokens, answer, intent = llm.process(text)
 
-        # Error handling
-        lowered = candidate.lower()
-        if ("no segmentation frame available" in lowered or
-            "failed to decode" in lowered or
-            "seg window input is off" in lowered):
-            return jsonify({"reply": candidate})
+    # Step 2: If not action (just chat), reply as usual
+    if (
+        intent.get("type") != "action" or
+        not intent.get("object") or
+        not intent.get("action")
+    ):
+        return jsonify({"reply": answer, "answer": answer})
 
-        # Draw overlay with ONLY the first (blue) cross
-        pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
-        raw_b64 = pil_to_b64(pil_img)
-        overlay = (
-            draw_points_on_image(pil_img, candidate, active_idx=0, only_active=True)
-            if candidate else pil_img
+    # Step 3: If action is ready, run RoboPoint pipeline!
+    # Compose instruction for RoboPoint (e.g., "pick the white cup in the middle of the screen")
+    object_phrase = intent["object"]
+    placement_str = intent["placement"] or ""
+    action_phrase = intent["action"]
+    instruction = f"{action_phrase} the {object_phrase} {placement_str}".strip()
+
+    # 3a: Send frame + instruction to RoboPoint
+    pts_str = robo_handler.call_remote_for_points(frame_b64, instruction)
+
+    # 3b: Decode returned points, run segmentation & geometry
+    pil_img = Image.open(io.BytesIO(base64.b64decode(frame_b64))).convert("RGB")
+    coords = re.findall(r"\(([0-9.]+),\s*([0-9.]+)\)", pts_str)
+    bx, by = map(float, coords[0]) if coords else (0.5, 0.5)
+
+    # Segment the best candidate
+    final_seg = sam_handler.run_sam_overlay(
+        pil_img, [(bx, by)], active_idx=0, max_dim=640
+    )
+    final_b64 = pil_to_b64(final_seg)
+
+    object_info = None
+    if depth_handler.start_realsense():
+        _, depth_arr = depth_handler.get_realsense_frames()
+        mask_bool = sam_handler.get_last_mask()
+        object_info = depth_handler.calculate_object_info(mask_bool, depth_arr)
+
+    # Format geometry for user
+    if object_info:
+        geometry_msg = (
+            f"Center: {', '.join(f'{v:.3f}' for v in object_info['center_xyz_m'])} m; "
+            f"distance {object_info['distance_m']:.3f} m; "
+            f"W×H {object_info['width_m']*100:.1f}×{object_info['height_m']*100:.1f} cm"
         )
-        overlay_b64 = pil_to_b64(overlay)
+    else:
+        geometry_msg = "(No geometry available)"
 
-        # Switch to confirm mode
-        g_state.update({
-            "mode"       : "confirm",
-            "points_str" : candidate
-        })
+    # 4: Respond to the user — no ugly [ACTION_READY]!
+    return jsonify({
+        "reply": "Finding object(s) and distance(s), please wait a few seconds",
+        "seg_frame": final_b64,
+        "object_info": object_info,
+        "geometry_msg": geometry_msg
+    })
 
-        return jsonify({
-            "reply"        : candidate,
-            "raw_frame"    : raw_b64,
-            "overlay_frame": overlay_b64
-        })
-
-    # ------------------------------------------------------------------
-    #  STAGE 2  User replies while in “confirm” mode
-    # ------------------------------------------------------------------
-    elif g_state["mode"] == "confirm":
-        if text in ("yes", "y"):
-            # --- a) run SAM at best point --------------------------------
-            coords = re.findall(r"\(([0-9.]+),\s*([0-9.]+)\)", g_state["points_str"])
-            bx, by = map(float, coords[0]) if coords else (0.5, 0.5)
-
-            pil_img   = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
-            final_seg = sam_handler.run_sam_overlay(
-                pil_img, [(bx, by)], active_idx=0, max_dim=640
-            )
-            final_b64 = pil_to_b64(final_seg)
-
-            # --- b) depth geometry --------------------------------------
-            object_info = None
-            if depth_handler.start_realsense():
-                _, depth_arr = depth_handler.get_realsense_frames()
-                mask_bool    = sam_handler.get_last_mask()
-                object_info  = depth_handler.calculate_object_info(mask_bool, depth_arr)
-
-            # --- c) reset state & return --------------------------------
-            g_state.update({"mode":"rgb", "points_str":""})
-            return jsonify({
-                "reply"       : "Segmentation confirmed.",
-                "seg_frame"   : final_b64,
-                "object_info" : object_info
-            })
-
-        else:
-            # User rejected – reset and allow new question
-            g_state.update({"mode":"rgb", "points_str":""})
-            return jsonify({"reply": "Candidate not confirmed. Returning to RGB mode."})
-
-    # ------------------------------------------------------------------
-    #  Unknown mode fallback
-    # ------------------------------------------------------------------
-    return jsonify({"reply": f"Unknown mode: {g_state['mode']}"})
 
 @app.route("/process_seg", methods=["POST"])
 def process_seg_endpoint():
