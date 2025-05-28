@@ -521,28 +521,6 @@ conda create -n dev_planner python=3.9
 conda activate dev_planner
 pip install -r requirements.txt
 ```
-
-## 📞 Support & Community
-
-### Getting Help
-1. **Check Troubleshooting**: Review common issues above
-2. **Enable Debug Mode**: Use `quiet=False` and `capture_output=True`
-3. **Check Dependencies**: Ensure all packages are correctly installed
-4. **Verify API Access**: Test Monica API key and connectivity
-
-### Reporting Issues
-When reporting bugs, please include:
-- Python version and OS
-- Complete error traceback
-- Sample image and task description
-- Pipeline logs (from `capture_output=True`)
-
-### Performance Tips
-- **Use Caching**: Avoid `force_reanalyze=True` unless necessary
-- **Batch Processing**: Process multiple tasks efficiently
-- **GPU Memory**: Monitor with `nvidia-smi`
-- **API Limits**: Be aware of Monica API rate limits
-
 ---
 
 **🚀 Ready to start planning robot actions? Import the module and begin with a simple task!** 
