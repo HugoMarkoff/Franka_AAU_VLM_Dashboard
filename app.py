@@ -17,12 +17,16 @@ import httpx, asyncio
 from utils.sam_handler import SamHandler
 from utils.depth_handler import DepthHandler, RS_OK
 from utils.robopoints_handler import RoboPointsHandler
+import os
 
 app = Flask(__name__)
 CORS(app)
 
+ROBOPOINT_IMAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROBOPOINT_IMAGE_COUNTER_FILE = os.path.join(ROBOPOINT_IMAGE_DIR, "robopoint_image_counter.txt")
+
 # in settings.py or top of app.py
-NGROK_BASE = "https://9733-130-225-198-197.ngrok-free.app"
+NGROK_BASE = "https://c2b4-130-225-198-197.ngrok-free.app"
 
 REMOTE_POINTS_ENDPOINT = f"{NGROK_BASE}/predict"      # RoboPoint
 LLM_STREAM             = f"{NGROK_BASE}/chat-stream"  # token stream
@@ -83,6 +87,17 @@ def _points_from_string(raw: str):
     matches = POINT_RE.findall(raw)
     return [tuple(map(float, xy)) for xy in matches]
 
+def get_next_image_index():
+    """Get and increment the persistent image index."""
+    if not os.path.exists(ROBOPOINT_IMAGE_COUNTER_FILE):
+        idx = 1
+    else:
+        with open(ROBOPOINT_IMAGE_COUNTER_FILE, "r") as f:
+            idx = int(f.read().strip() or "1")
+    with open(ROBOPOINT_IMAGE_COUNTER_FILE, "w") as f:
+        f.write(str(idx + 1))
+    return idx
+
 
 # ────────────────────────────────────────────────────────────────────
 #  /exec_action  – returns placement + full geometry string
@@ -90,19 +105,7 @@ def _points_from_string(raw: str):
 @app.route("/exec_action", methods=["POST"])
 def exec_action():
     """
-    POST  {
-      "action_block": "<full [ACTION] text>",
-      "seg_frame"   : "<base64 RGB frame>"
-    }
-
-    Success 200  {
-      "seg_frame"   : "<JPEG with mask>",
-      "found_msg"   : "…",                # human-readable summary
-      "geometry_msg": "Center: …",        # always present (or "(No geometry…)")
-      "placement"   : "centre-left",      # coarse location in the frame
-      "object_info" : {…}|null,           # raw numbers (may be null)
-      "rp_result"   : "[(…)]"             # RoboPoint raw string
-    }
+    Enhanced version that handles single action from multi-step sequence
     """
     global g_last_raw_frame
 
@@ -110,33 +113,49 @@ def exec_action():
     block_txt   = data.get("action_block", "")
     frame_b64   = data.get("seg_frame", "")
 
-    # 0) Decode frozen frame ---------------------------------------------------
+    # 0) Decode frozen frame
     try:
         g_last_raw_frame = base64.b64decode(frame_b64)
     except Exception as e:
         return jsonify({"error": f"Invalid seg_frame: {e}"}), 400
     pil_img = Image.open(io.BytesIO(g_last_raw_frame)).convert("RGB")
+    # --- SAVE THE IMAGE ---
+    img_idx = get_next_image_index()
+    img_path = os.path.join(ROBOPOINT_IMAGE_DIR, f"{img_idx}.jpg")
+    pil_img.save(img_path, "JPEG")
+    print(f"[INFO] Saved RoboPoint image as {img_path}")
 
-    # 1) Build RoboPoint instruction ------------------------------------------
-    m = re.search(r"RoboPoint\s*Request:\s*([^;\n|]+)", block_txt, flags=re.I)
-    if not m:
+    # 1) Parse action block
+    request_match = re.search(r"RoboPoint\s*Request:\s*([^;\n|]+)", block_txt, flags=re.I)
+    action_match = re.search(r"Action\s*Request:\s*([^;\n|]+)", block_txt, flags=re.I)
+    
+    if not request_match or not action_match:
         return jsonify({"error": "Malformed [ACTION] block"}), 400
-    obj_phrase  = m.group(1).strip()
-    instruction = re.sub(r"^\s*the\s+", "", obj_phrase, flags=re.I)
+    
+    obj_phrase = request_match.group(1).strip()
+    action_type = action_match.group(1).strip().lower()
+    
+    # Extract object and location
+    if " at " in obj_phrase:
+        object_name, location = obj_phrase.split(" at ", 1)
+        instruction = f"{action_type} the {object_name.strip()} at {location.strip()}"
+    else:
+        object_name = obj_phrase
+        instruction = f"{action_type} the {object_name.strip()}"
 
-    # 2) Call RoboPoint --------------------------------------------------------
+    # 2) Call RoboPoint
     rp_result = robo_handler.call_remote_for_points(frame_b64, instruction)
     print(f"[RoboPoint result] {rp_result}")
     pts = _points_from_string(rp_result)
 
     if not pts:
-        err = f"RoboPoint returned no usable coordinates for “{instruction}”."
+        err = f"RoboPoint returned no usable coordinates for '{instruction}'."
         return jsonify({"error": err, "rp_result": rp_result}), 502
 
     # Use the first candidate point
     x0, y0 = pts[0]
 
-    # 3) Quick coarse placement -----------------------------------------------
+    # 3) Determine placement description
     def coarse_placement(nx: float, ny: float) -> str:
         col = "left" if nx < 0.33 else "right" if nx > 0.66 else "centre"
         row = "top"  if ny < 0.33 else "bottom" if ny > 0.66 else "middle"
@@ -144,43 +163,46 @@ def exec_action():
 
     placement = coarse_placement(x0, y0)
 
-    # 4) SAM overlay -----------------------------------------------------------
+    # 4) SAM overlay
     seg_img = sam_handler.run_sam_overlay(pil_img, pts, active_idx=0)
     seg_img = draw_points_on_image(seg_img, str(pts), active_idx=0, only_active=True)
     seg_b64 = pil_to_b64(seg_img)
 
-    # 5) Depth geometry --------------------------------------------------------
+    # 5) Depth geometry (only for pick operations or when available)
     object_info = None
+    geometry_msg = "(No geometry available)"
+    
     if depth_handler.start_realsense():
         _, depth_arr = depth_handler.get_realsense_frames()
         mask_bool    = sam_handler.get_last_mask()
         object_info  = depth_handler.calculate_object_info(mask_bool, depth_arr)
+        
+        if object_info:
+            cx, cy, cz = object_info["center_xyz_m"]
+            if "pick" in action_type:
+                # Full geometry for pick operations
+                geometry_msg = (
+                    f"Center: {cx:.3f}, {cy:.3f}, {cz:.3f} m; "
+                    f"distance {object_info['distance_m']:.3f} m; "
+                    f"W×H {object_info['width_m']*100:.1f}×"
+                    f"{object_info['height_m']*100:.1f} cm"
+                )
+            else:
+                # Just center point and height for place operations
+                geometry_msg = f"Center: {cx:.3f}, {cy:.3f}, {cz:.3f} m"
 
-    if object_info:
-        cx, cy, cz   = object_info["center_xyz_m"]
-        geometry_msg = (
-            f"Center: {cx:.3f}, {cy:.3f}, {cz:.3f} m; "
-            f"distance {object_info['distance_m']:.3f} m; "
-            f"W×H {object_info['width_m']*100:.1f}×"
-            f"{object_info['height_m']*100:.1f} cm"
-        )
-    else:
-        geometry_msg = "(No geometry available)"
+    # 6) Human-readable found message
+    found_msg = f"{instruction} located at {placement} ({x0:.2f}, {y0:.2f})"
 
-    # 6) Human-readable found message -----------------------------------------
-    found_msg = (
-        f"{instruction} located at {placement} "
-        f"({x0:.2f}, {y0:.2f}); {geometry_msg}"
-    )
-
-    # 7) Respond ---------------------------------------------------------------
+    # 7) Respond
     return jsonify({
         "seg_frame"   : seg_b64,
-        "found_msg"   : found_msg,     # richer text for chat UI
-        "geometry_msg": geometry_msg,  # fine-grained numbers
+        "found_msg"   : found_msg,
+        "geometry_msg": geometry_msg,
         "placement"   : placement,
         "object_info" : object_info,
-        "rp_result"   : rp_result
+        "rp_result"   : rp_result,
+        "action_type" : action_type
     })
 
 

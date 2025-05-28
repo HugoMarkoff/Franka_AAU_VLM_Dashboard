@@ -51,6 +51,12 @@
       object-fit: contain;
       display: block;
     }
+    #llmConsole{
+      font-size: 2em;          /* twice the original size  */
+      line-height: 1.4;
+      white-space: pre-wrap;   /* keep spaces & wrap long lines */
+      word-break: break-word;
+    }
     /* Overlay for image mode if no image is chosen */
     #uploadButton {
       position: absolute;
@@ -172,20 +178,36 @@
     </div>
   </div>
 
-  <!-- Row3, Col1: Chat (Window4) -->
-  <div class="panel" style="grid-row:3; grid-column:1;">
-    <div class="panel-title">Chat (Window4)</div>
-    <div id="chatMessages" style="flex:1; overflow-y:auto; background:#111; border:1px solid #666; padding:4px; margin-top:30px;"></div>
-    <div style="margin-top:8px; display:flex;">
-      <input type="text" id="chatInput" class="bg-gray-800 text-green-300 border border-green-500 px-2 py-1 flex-1" placeholder="Type command...">
-      <button id="chatSendBtn" class="neon-btn px-3 py-1" style="margin-left:8px;">Send</button>
+<!-- Row3, Col1: Chat (Window4) - Modified -->
+<div class="panel" style="grid-row:3; grid-column:1;">
+  <div class="panel-title">Chat (Window4)</div>
+  
+  <!-- Welcome/Instructions Area (top 20%) -->
+  <div style="height:20%; margin-top:30px; background:#0a0a0a; border:1px solid #4af; padding:8px; border-radius:4px; overflow-y:auto;">
+    <div style="color:#4af; font-weight:bold; margin-bottom:4px;">🤖 AAU Robot Assistant</div>
+    <div style="font-size:0.9em; line-height:1.3; color:#ccc;">
+      <strong>Welcome!</strong> I can help you with:<br>
+      • <strong>Pick objects:</strong> "Pick the red cup on the left"<br>
+      • <strong>Place objects:</strong> "Place it in the dishwasher"<br>
+      • <strong>Multi-step:</strong> "Pick the cup and place it on the table"<br>
+      • <strong>Chat & ask questions</strong> about what I can see<br>
+      <em style="color:#4af;">💡 Tip: Be specific about objects and locations!</em>
     </div>
   </div>
+  
+  <!-- Chat Messages Area (remaining 80%) -->
+  <div id="chatMessages" style="flex:1; height:calc(80% - 40px); overflow-y:auto; background:#111; border:1px solid #666; padding:4px; margin-top:8px;"></div>
+  
+  <div style="margin-top:8px; display:flex;">
+    <input type="text" id="chatInput" class="bg-gray-800 text-green-300 border border-green-500 px-2 py-1 flex-1" placeholder="Type command...">
+    <button id="chatSendBtn" class="neon-btn px-3 py-1" style="margin-left:8px;">Send</button>
+  </div>
+</div>
 
   <!-- Row3, Col2: LLM Reasoning (Window7) -->
   <div class="panel" style="grid-row:3; grid-column:2; display:flex; flex-direction:column;">
     <div class="panel-title">LLM Reasoning (Window7)</div>
-    <div id="llmConsole" class="console-area" style="margin-top:30px;"></div>
+    <div id="llmConsole" class="console-area" style="margin-top:30px; font-size:2em; line-height:1.4;"></div>
   </div>
 </div>
 
@@ -346,6 +368,316 @@
     } catch {}
   }
   
+async function sendChatStream(customText){
+  const userText = (customText || chatInput.value).trim();
+  if (!userText) return;
+
+  chatInput.value = "";
+  addChatMessage("You", userText);
+  llmConsole.innerHTML = "";
+
+  try {
+    // Try streaming first
+    console.log("🔍 Attempting streaming request...");
+    const success = await tryStreamingChat(userText);
+    
+    if (!success) {
+      console.log("🔄 Streaming failed, trying non-streaming fallback...");
+      await tryFallbackChat(userText);
+    }
+    
+  } catch (error) {
+    console.error("❌ Chat error:", error);
+    addChatMessage("AAU Agent", `Error: ${error.message}. Please try again.`);
+  }
+}
+
+async function tryStreamingChat(userText) {
+  try {
+    const resp = await fetch("/chat-stream", {
+      method : "POST",
+      headers: { "Content-Type":"application/json" },
+      body   : JSON.stringify({ text: userText })
+    });
+
+    if (!resp.ok) {
+      console.log(`❌ Streaming response not ok: ${resp.status}`);
+      return false;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let completeResponse = "";
+    let reasoning = "";
+    let answer = "";
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, {stream: true});
+      completeResponse += chunk;
+      
+      // Process each event
+      const events = chunk.split(/\n\n/);
+      for (const event of events) {
+        if (!event.trim()) continue;
+        
+        console.log("📥 Stream event:", event.substring(0, 100) + "...");
+        
+        if (event.startsWith("event: reasoning")) {
+          const reasoningText = event.slice(event.indexOf("data:") + 5).trim();
+          reasoning += reasoningText + " ";
+          llmConsole.innerHTML = reasoning.replace(/\n/g, "<br>");
+          llmConsole.scrollTop = llmConsole.scrollHeight;
+        }
+        else if (event.startsWith("event: answer")) {
+          const answerText = event.slice(event.indexOf("data:") + 5).trim();
+          answer += answerText;
+        }
+        else if (event.startsWith("data: ") && !event.includes("event:")) {
+          // Direct data without event type
+          answer += event.slice(6);
+        }
+      }
+    }
+
+    console.log("🔍 Streaming complete. Full answer:", answer);
+    
+    if (answer.trim()) {
+      answer = answer.replace(/\[DONE\]$/i, "").trim();
+      await processLLMResponse(answer);
+      return true;
+    } else {
+      console.log("❌ No answer received from streaming");
+      return false;
+    }
+    
+  } catch (error) {
+    console.error("❌ Streaming error:", error);
+    return false;
+  }
+}
+
+async function tryFallbackChat(userText) {
+  try {
+    addChatMessage("AAU Agent", "Processing your request...");
+    
+    const resp = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: userText })
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Server error: ${resp.status}`);
+    }
+
+    const data = await resp.json();
+    console.log("🔍 Fallback response:", data);
+    
+    if (data.result) {
+      await processLLMResponse(data.result);
+    } else {
+      addChatMessage("AAU Agent", "I didn't receive a valid response. Please try again.");
+    }
+    
+  } catch (error) {
+    console.error("❌ Fallback error:", error);
+    addChatMessage("AAU Agent", `Fallback error: ${error.message}`);
+  }
+}
+
+async function processLLMResponse(response) {
+  console.log("🔍 Processing LLM response:", response);
+  
+  if (response.includes("[ACTION]")) {
+    console.log("✅ ACTION block detected");
+    await executeMultiStepActions(response);
+  } else {
+    console.log("💬 Regular chat response");
+    addChatMessage("AAU Agent", response);
+  }
+}
+
+async function executeMultiStepActions(actionBlock) {
+  console.log("🔍 DEBUG: Raw action block:");
+  console.log(actionBlock);
+  
+  try {
+    // Extract [ACTION] block content
+    const actionMatch = actionBlock.match(/\[ACTION\]\s*([\s\S]*?)(?:\n\n|$)/i);
+    if (!actionMatch) {
+      throw new Error("Could not find [ACTION] block in response");
+    }
+    
+    const content = actionMatch[1].trim();
+    console.log("🔍 DEBUG: Action content:");
+    console.log(content);
+    
+    // Split into lines, but also handle if both are on the same line
+    let lines = content.split('\n').map(line => line.trim()).filter(line => line);
+
+    // If only one line and it contains both requests, split it
+    if (lines.length === 1 && lines[0].includes("Action Request:")) {
+      const idx = lines[0].indexOf("Action Request:");
+      lines = [
+        lines[0].slice(0, idx).trim(),
+        lines[0].slice(idx).trim()
+      ];
+    }
+    console.log("🔍 DEBUG: All lines:", lines);
+    
+    // Find the required lines
+    let roboPointLine = null;
+    let actionLine = null;
+    
+    for (const line of lines) {
+      if (line.match(/^\s*RoboPoint\s+Request\s*:/i)) {
+        roboPointLine = line;
+        console.log("✅ Found RoboPoint line:", line);
+      } else if (line.match(/^\s*Action\s+Request\s*:/i)) {
+        actionLine = line;
+        console.log("✅ Found Action line:", line);
+      }
+    }
+    
+    // Detailed error reporting
+    if (!roboPointLine) {
+      console.log("❌ Available lines:", lines);
+      addChatMessage("AAU Agent", 
+        `Error: Missing 'RoboPoint Request:' line. ` +
+        `I received: ${lines.join(' | ')}. ` +
+        `Please ask me again - I need both request and action lines.`
+      );
+      return;
+    }
+    
+    if (!actionLine) {
+      console.log("❌ Available lines:", lines);
+      addChatMessage("AAU Agent", 
+        `Error: Missing 'Action Request:' line. ` +
+        `I found the RoboPoint line but need the Action line too. ` +
+        `Available: ${lines.join(' | ')}. Please try asking again.`
+      );
+      return;
+    }
+    
+    // Extract content after colons
+    const roboPointContent = roboPointLine.split(':', 2)[1];
+    const actionContent = actionLine.split(':', 2)[1];
+    
+    if (!roboPointContent || !actionContent) {
+      addChatMessage("AAU Agent", "Error: Could not extract content from request/action lines");
+      return;
+    }
+    
+    // Parse the semicolon-separated values
+    const objects = roboPointContent.split(';').map(s => s.trim()).filter(s => s);
+    const actions = actionContent.split(';').map(s => s.trim()).filter(s => s);
+    
+    console.log("🔍 DEBUG: Parsed objects:", objects);
+    console.log("🔍 DEBUG: Parsed actions:", actions);
+    
+    if (objects.length !== actions.length) {
+      addChatMessage("AAU Agent", 
+        `Error: Mismatch between objects (${objects.length}) and actions (${actions.length}). ` +
+        `Objects: [${objects.join(', ')}] Actions: [${actions.join(', ')}]`
+      );
+      return;
+    }
+    
+    if (objects.length === 0) {
+      addChatMessage("AAU Agent", "Error: No valid commands found in the action block");
+      return;
+    }
+    
+    // Success - start processing
+    addChatMessage("AAU Agent", `✅ Found ${objects.length} command(s). Starting execution...`);
+    
+    // Capture frame
+    let frameB64 = "";
+    try {
+      frameB64 = await captureSegFrame();
+      freezeSegWindow(frameB64);
+    } catch(e) { 
+      console.warn("No seg frame:", e);
+      addChatMessage("AAU Agent", "Warning: Could not capture camera frame. Continuing anyway...");
+    }
+
+    // Execute each command
+    for (let i = 0; i < objects.length; i++) {
+      const object = objects[i];
+      const action = actions[i];
+
+      addChatMessage("AAU Agent", `🔄 Step ${i+1}: Finding "${object}"...`);
+
+      try {
+        const result = await executeRoboPointCommand(object, action, frameB64);
+
+        if (result.seg_frame) {
+          segImg.src = "data:image/jpeg;base64," + result.seg_frame;
+        }
+
+        // Show location for both pick and place
+        if (result.object_info && result.object_info.center_xyz_m) {
+          const info = result.object_info;
+          addChatMessage("AAU Agent", 
+            `✅ Step ${i+1}: Successfully found "${object}"! Location: ${info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m, Distance: ${info.distance_m.toFixed(3)} m, Size: ${(info.width_m*100).toFixed(1)}×${(info.height_m*100).toFixed(1)} cm`
+          );
+        } else {
+          addChatMessage("AAU Agent", `✅ Step ${i+1}: Successfully found "${object}"`);
+        }
+
+        // Pause between steps
+        if (i < objects.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 800));
+        }
+
+      } catch (error) {
+        console.error(`❌ Step ${i+1} failed:`, error);
+        addChatMessage("AAU Agent", `❌ Step ${i+1} Failed: ${error.message}`);
+        break;
+      }
+    }
+    
+    addChatMessage("AAU Agent", `🎉 Completed ${objects.length} action(s)!`);
+    
+  } catch (error) {
+    console.error("❌ Action parsing error:", error);
+    addChatMessage("AAU Agent", `Action parsing error: ${error.message}`);
+  }
+}
+
+async function executeRoboPointCommand(objectDescription, action, frameB64) {
+  const singleActionBlock = `[ACTION]\nRoboPoint Request: ${objectDescription}\nAction Request: ${action}`;
+  
+  console.log("📤 Sending to RoboPoint:", singleActionBlock);
+  
+  const resp = await fetch("/exec_action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action_block: singleActionBlock,
+      seg_frame: frameB64
+    })
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error(`Server error ${resp.status}: ${errorText}`);
+  }
+
+  const result = await resp.json();
+  console.log("📥 RoboPoint result:", result);
+  
+  if (result.error) {
+    throw new Error(result.error);
+  }
+  
+  return result;
+}
+
 // Freeze the Seg window — no more frames will arrive until we unfreeze
 function freezeSegWindow(base64Frame) {
   segFrozen    = true;
@@ -543,10 +875,11 @@ segContainer.addEventListener("click", async ev => {
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
   
+
 /****************************************************
  * CHAT (Window4)  — send a line to the back-end
  ****************************************************/
- async function sendChat(customText){
+async function sendChat(customText){
   const txt       = (customText || chatInput.value).trim();
   if (!txt) return;
 
@@ -571,17 +904,12 @@ segContainer.addEventListener("click", async ev => {
   } catch {}
 
   //-------------------------------------------------
-  // Tell the user what we’re about to do
+  // Show waiting message
   //-------------------------------------------------
-  const txtLower = txt.toLowerCase();
-  if (txtLower === "yes" || txtLower === "y"){
-    addChatMessage("AAU Agent", "Confirming your selection…");
-  } else {
-    addChatMessage(
-      "AAU Agent",
-      "Sending request to AI server, this may take a few seconds…"
-    );
-  }
+  addChatMessage(
+    "AAU Agent",
+    "Finding object(s) and distance(s), please wait a few seconds"
+  );
 
   //-------------------------------------------------
   // Call the Flask back-end
@@ -599,7 +927,6 @@ segContainer.addEventListener("click", async ev => {
     });
 
     if (!resp.ok){
-      // server returned 4xx/5xx → show first 120 chars of plain text
       const errText = (await resp.text()).slice(0,120);
       addChatMessage("AAU Agent", `Server error (${resp.status}): ${errText}`);
       return;
@@ -613,45 +940,29 @@ segContainer.addEventListener("click", async ev => {
   }
 
   //-------------------------------------------------
-  // Show overlay frame (candidate OR final segment)
+  // Show overlay frame (segmentation)
   //-------------------------------------------------
-  const ov = d.overlay_frame || d.seg_frame;
-  if (ov) {
-    // Just update directly—no blanking + timeout
-    segImg.src = "data:image/jpeg;base64," + ov;
-  }
-
-
-  //-------------------------------------------------
-  // Show geometry if present
-  //-------------------------------------------------
-  if (d.object_info){
-    addChatMessage(
-      "AAU Agent",
-      `Center: ${d.object_info.center_xyz_m.map(v=>v.toFixed(3)).join(', ')} m, `
-    + `distance ${d.object_info.distance_m.toFixed(3)} m, `
-    + `W×H ${(d.object_info.width_m*100).toFixed(1)}×${(d.object_info.height_m*100).toFixed(1)} cm`
-    );
+  if (d.seg_frame) {
+    segImg.src = "data:image/jpeg;base64," + d.seg_frame;
   }
 
   //-------------------------------------------------
-  // Always show the first line of the textual reply
+  // Show geometry info in chat
   //-------------------------------------------------
-  addChatMessage("AAU Agent", d.reply.split("\n")[0]);
+  if (d.geometry_msg){
+    addChatMessage("AAU Agent", d.geometry_msg);
+  }
 
   //-------------------------------------------------
-  // If we’re still in confirm stage, prompt the user
+  // Always show the interim reply (should be the "please wait" string)
   //-------------------------------------------------
-  if (d.overlay_frame && !d.seg_frame){
-    setTimeout(()=> addChatMessage(
-      "AAU Agent",
-      "Selecting best candidate point (in blue). Please type “yes” if the point is on the correct object."
-    ), 800);
-  }
+  // (If you want to show LLM answer after, add: addChatMessage("AAU Agent", d.reply);)
 }
 
-  chatSendBtn.addEventListener("click",()=>sendChat());
-  chatInput.addEventListener("keyup",e=>{ if(e.key==="Enter") sendChat(); });
+
+chatSendBtn.addEventListener("click",()=>sendChatStream());
+chatInput.addEventListener("keyup",e=>{ if(e.key==="Enter") sendChatStream(); });
+
   
   /****************************************************
    * LLM Console
