@@ -21,6 +21,7 @@ from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 import io
 import contextlib
+from openai import OpenAI
 
 # =============================================================================
 # CONFIGURATION
@@ -28,11 +29,6 @@ import contextlib
 
 # Model Configuration
 QWEN2_5_VL_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
-
-# Monica API Configuration for DeepSeek
-MONICA_API_URL = "https://openapi.monica.im/v1/chat/completions"
-MONICA_API_KEY = ""
-ONLINE_MODEL = "deepseek-chat"
 
 # Available Robot Actions
 AVAILABLE_ACTIONS = {
@@ -88,24 +84,23 @@ def call_online_llm(prompt, max_tokens=512):
         str or None: Response text or None if error
     """
     try:
-        response = requests.post(
-            MONICA_API_URL,
-            headers={
-                "Authorization": f"Bearer {MONICA_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": ONLINE_MODEL,
-                "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                "max_tokens": max_tokens
-            }
+        client = OpenAI(api_key="sk-0cfe59a4171744658e2c9db9ffd8082d", base_url="https://api.deepseek.com")
+
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False
         )
-        
-        response_data = response.json()
-        if 'choices' in response_data and len(response_data['choices']) > 0:
-            return response_data['choices'][0]['message']['content']
+
+        response = response.choices[0].message.content
+
+        if len(response) > 0:
+            return response
         else:
-            print(f"[ERROR] No response content found: {response_data}")
+            print(f"[ERROR] No response content found: {response}")
             return None
             
     except Exception as e:
