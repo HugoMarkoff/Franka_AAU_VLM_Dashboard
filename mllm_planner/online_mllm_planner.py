@@ -84,7 +84,7 @@ def call_online_llm(prompt, max_tokens=512):
         str or None: Response text or None if error
     """
     try:
-        client = OpenAI(api_key="sk-0cfe59a4171744658e2c9db9ffd8082d", base_url="https://api.deepseek.com")
+        client = OpenAI(api_key="", base_url="https://api.deepseek.com")
 
         response = client.chat.completions.create(
             model="deepseek-chat",
